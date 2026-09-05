@@ -21,6 +21,7 @@
 #include "./common.h"
 #include "./lexer.h"
 #include "./sv.h"
+#include "./vim.h"
 
 // TODO: Save file dialog
 // Needed when ded is ran without any file so it does not know where to save.
@@ -51,6 +52,7 @@ static Free_Glyph_Atlas atlas = {0};
 static Simple_Renderer sr = {0};
 static Editor editor = {0};
 static File_Browser fb = {0};
+static Vim_State vim = {0};
 
 // TODO: display errors reported via flash_error right in the text editor window somehow
 #define flash_error(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
@@ -159,6 +161,9 @@ int main(int argc, char **argv)
     editor.atlas = &atlas;
     editor_retokenize(&editor);
 
+    vim = vim_state_init();
+    editor.cursor_block = (vim.mode == VIM_MODE_NORMAL);
+
     bool quit = false;
     bool file_browser = false;
     while (!quit) {
@@ -232,8 +237,12 @@ int main(int argc, char **argv)
                     break;
                     }
                 } else {
+                    if (vim_handle_key(&vim, &editor, event.key.keysym)) {
+                        editor.last_stroke = SDL_GetTicks();
+                    } else {
                     switch (event.key.keysym.sym) {
                     case SDLK_HOME: {
+                        editor_flush_group(&editor);
                         editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
                         if (event.key.keysym.mod & KMOD_CTRL) {
                             editor_move_to_begin(&editor);
@@ -244,6 +253,7 @@ int main(int argc, char **argv)
                     } break;
 
                     case SDLK_END: {
+                        editor_flush_group(&editor);
                         editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
                         if (event.key.keysym.mod & KMOD_CTRL) {
                             editor_move_to_end(&editor);
@@ -261,6 +271,7 @@ int main(int argc, char **argv)
 
                     case SDLK_F2: {
                         if (editor.file_path.count > 0) {
+                            editor_flush_group(&editor);
                             err = editor_save(&editor);
                             if (err != 0) {
                                 flash_error("Could not save currently edited file: %s", strerror(err));
@@ -273,6 +284,7 @@ int main(int argc, char **argv)
                     break;
 
                     case SDLK_F3: {
+                        editor_flush_group(&editor);
                         file_browser = true;
                     }
                     break;
@@ -282,8 +294,27 @@ int main(int argc, char **argv)
                     }
                     break;
 
+                    case SDLK_z: {
+                        if (event.key.keysym.mod & KMOD_CTRL) {
+                            if (event.key.keysym.mod & KMOD_SHIFT) {
+                                editor_redo(&editor);
+                            } else {
+                                editor_undo(&editor);
+                            }
+                        }
+                    }
+                    break;
+
+                    case SDLK_y: {
+                        if (event.key.keysym.mod & KMOD_CTRL) {
+                            editor_redo(&editor);
+                        }
+                    }
+                    break;
+
                     case SDLK_RETURN: {
                         if (editor.searching) {
+                            editor_flush_group(&editor);
                             editor_stop_search(&editor);
                         } else {
                             editor_insert_char(&editor, '\n');
@@ -300,12 +331,14 @@ int main(int argc, char **argv)
 
                     case SDLK_f: {
                         if (event.key.keysym.mod & KMOD_CTRL) {
+                            editor_flush_group(&editor);
                             editor_start_search(&editor);
                         }
                     }
                     break;
 
                     case SDLK_ESCAPE: {
+                        editor_flush_group(&editor);
                         editor_stop_search(&editor);
                         editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
                     }
@@ -313,6 +346,7 @@ int main(int argc, char **argv)
 
                     case SDLK_a: {
                         if (event.key.keysym.mod & KMOD_CTRL) {
+                            editor_flush_group(&editor);
                             editor.selection = true;
                             editor.select_begin = 0;
                             editor.cursor = editor.data.count;
@@ -321,34 +355,44 @@ int main(int argc, char **argv)
                     break;
 
                     case SDLK_TAB: {
-                        // TODO: indent on Tab instead of just inserting 4 spaces at the cursor
-                        // That is insert the spaces at the beginning of the line. Shift+TAB should
-                        // do unindent, that is remove 4 spaces from the beginning of the line.
                         // TODO: customizable indentation style
                         // - tabs/spaces
                         // - tab width
                         // - etc.
-                        for (size_t i = 0; i < 4; ++i) {
-                            editor_insert_char(&editor, ' ');
+                        if (event.key.keysym.mod & KMOD_SHIFT) {
+                            editor_unindent(&editor);
+                        } else {
+                            editor_indent(&editor);
                         }
                     }
                     break;
 
                     case SDLK_c: {
                         if (event.key.keysym.mod & KMOD_CTRL) {
+                            editor_flush_group(&editor);
                             editor_clipboard_copy(&editor);
+                        }
+                    }
+                    break;
+
+                    case SDLK_x: {
+                        if (event.key.keysym.mod & KMOD_CTRL) {
+                            editor_flush_group(&editor);
+                            editor_clipboard_cut(&editor);
                         }
                     }
                     break;
 
                     case SDLK_v: {
                         if (event.key.keysym.mod & KMOD_CTRL) {
+                            editor_flush_group(&editor);
                             editor_clipboard_paste(&editor);
                         }
                     }
                     break;
 
                     case SDLK_UP: {
+                        editor_flush_group(&editor);
                         editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
                         if (event.key.keysym.mod & KMOD_CTRL) {
                             editor_move_paragraph_up(&editor);
@@ -360,6 +404,7 @@ int main(int argc, char **argv)
                     break;
 
                     case SDLK_DOWN: {
+                        editor_flush_group(&editor);
                         editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
                         if (event.key.keysym.mod & KMOD_CTRL) {
                             editor_move_paragraph_down(&editor);
@@ -371,6 +416,7 @@ int main(int argc, char **argv)
                     break;
 
                     case SDLK_LEFT: {
+                        editor_flush_group(&editor);
                         editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
                         if (event.key.keysym.mod & KMOD_CTRL) {
                             editor_move_word_left(&editor);
@@ -382,6 +428,7 @@ int main(int argc, char **argv)
                     break;
 
                     case SDLK_RIGHT: {
+                        editor_flush_group(&editor);
                         editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
                         if (event.key.keysym.mod & KMOD_CTRL) {
                             editor_move_word_right(&editor);
@@ -392,6 +439,7 @@ int main(int argc, char **argv)
                     }
                     break;
                     }
+                    }
                 }
             }
             break;
@@ -400,6 +448,19 @@ int main(int argc, char **argv)
                 if (file_browser) {
                     // Nothing for now
                     // Once we have incremental search in the file browser this may become useful
+                } else if (vim_take_consumed_textinput(&vim)) {
+                    // vim_handle_key just claimed the SDL_KEYDOWN this
+                    // SDL_TEXTINPUT belongs to (even if that command, like
+                    // 'i', switched us to Insert mode) - swallow it so the
+                    // command letter doesn't also get typed into the buffer.
+                } else if (!editor.searching && vim.mode == VIM_MODE_NORMAL) {
+                    // Normal mode: letters not (yet) bound to a command are
+                    // still not text - swallow them too rather than typing
+                    // them. Not while searching, though: vim_handle_key steps
+                    // aside entirely then (see vim.c), so this event is the
+                    // search query being typed and must reach editor_insert_buf
+                    // below, which routes it into e->search instead of the
+                    // document.
                 } else {
                     const char *text = event.text.text;
                     size_t text_len = strlen(text);
