@@ -37,9 +37,9 @@ int main(int argc, char **argv)
     app_register_commands();
 
     Config cfg = config_default();
-    Errno err = config_load("./ded.conf", &cfg);
+    Errno err = config_load("./dede.conf", &cfg);
     if (err != 0) {
-        fprintf(stderr, "WARNING: could not read ./ded.conf: %s\n", strerror(err));
+        fprintf(stderr, "WARNING: could not read ./dede.conf: %s\n", strerror(err));
     }
 
     FT_Library library = {0};
@@ -72,7 +72,7 @@ int main(int argc, char **argv)
     }
 
     SDL_Window *window =
-        SDL_CreateWindow("ded",
+        SDL_CreateWindow("dede",
                          0, 0,
                          SCREEN_WIDTH, SCREEN_HEIGHT,
                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);

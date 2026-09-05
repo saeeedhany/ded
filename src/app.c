@@ -419,7 +419,7 @@ static void cmd_paste(void)
 }
 
 // Not bound to any default chord - opt in via `bind <chord> =
-// toggle-vim-mode` in ded.conf. See vim_enabled's own comment.
+// toggle-vim-mode` in dede.conf. See vim_enabled's own comment.
 static void cmd_toggle_vim_mode(void)
 {
     vim_enabled = !vim_enabled;
