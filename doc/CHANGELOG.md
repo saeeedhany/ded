@@ -1,10 +1,10 @@
-# ded — Progress Log
+# dede — Changelog
 
-A living document describing where the project started, what has been changed so far, and what is still left to do. See `README.md` for build instructions.
+A chronological log of what changed and why, since this fork diverged from upstream `ded`. See [`ROADMAP.md`](ROADMAP.md) for what's left and [`NOTES.md`](NOTES.md) for known quirks and stray TODOs.
 
 ## 1. Starting point
 
-`ded` ("Dramatic EDitor") is an unfinished single-file text editor in C11. It was already able to:
+`ded` ("Dramatic EDitor", by Alexey Kutepov / tsoding) is an unfinished text editor in C11. At the point this fork started, it could already:
 
 - **Open/save** a file: load via command line or the file browser, save with `F2`.
 - **File browser** (`F3`): sorted file listing, directory navigation, path normalization, and a rainbow "epicness" shader.
@@ -17,7 +17,7 @@ A living document describing where the project started, what has been changed so
 
 Stack: SDL2 + OpenGL 3.3 + GLEW + FreeType, using hand-rolled data structures (dynamic arrays, string views, string builders, arena, glyph atlas, immediate-mode mesh renderer).
 
-## 2. What we did (chronological)
+## 2. What changed (chronological)
 
 ### 2.1 Undo / redo — Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z
 `src/editor.h`, `src/editor.c`, `src/main.c`
@@ -87,7 +87,7 @@ Architectural groundwork, not a user-facing feature by itself: `main.c`'s ~240-l
 - **`Editor::indent_width`** replaces the old compile-time `INDENT_WIDTH` macro, so `tab_width` in the config file actually does something; capped at the new `EDITOR_MAX_INDENT_WIDTH` (16), which sizes `editor_indent`/`editor_unindent`'s scratch buffers.
 - Three small, deliberate behavior simplifications made along the way (none were an intentional design choice in the original switch - just modifiers it never bothered checking because it didn't need to for a single hardcoded binding): Backspace/Delete/Return/F2/F3/F5 no longer also fire with Ctrl and/or Shift incidentally held; Escape no longer also fires on Ctrl+Escape; Tab/Shift+Tab no longer also fire on Ctrl+Tab/Ctrl+Shift+Tab, freeing those chords for a future tab-switching feature instead of silently indenting.
 - One accepted, narrow behavior change from the refactor itself: Escape's Shift-extends-selection handling now runs *before* `editor_stop_search` instead of after (the dispatcher always resolves shift first, generically), so `editor_update_selection`'s own `if (e->searching) return` guard can now suppress it in the specific case of Shift+Escape pressed while both searching and holding a selection. A zero-argument command can't reproduce ordering that depends on the specific event that resolved to it; this combination was judged too obscure to be worth breaking that abstraction over.
-- `./ded.conf` (repo/cwd-relative — not yet an XDG-style user config path, a natural follow-up) is loaded unconditionally at startup; `font`, `tab_width`, and arbitrary `bind` overrides are all it understands so far. Colors/theming are not configurable yet.
+- `./dede.conf` (repo/cwd-relative — not yet an XDG-style user config path, a natural follow-up) is loaded unconditionally at startup; `font`, `tab_width`, and arbitrary `bind` overrides are all it understands so far. Colors/theming are not configurable yet.
 
 ### 2.9 Two more bugs, and counts + Visual mode
 `src/main.c`, `src/vim.c`, `src/vim.h`, `src/tes_motion.c`
@@ -109,47 +109,8 @@ Architectural groundwork, not a user-facing feature by itself: `main.c`'s ~240-l
 - **Vim now reaches the file browser**: `vim_handle_browser_key(Vim_State*, File_Browser*, SDL_Keysym)` in `vim.c` adds `j`/`k` (with counts), `gg`/`G` for the flat file list, tried before the existing Up/Down/Enter/F3 handling (unchanged, still the fallback with Vim off or on an unclaimed key).
 - **`Editor`/`Config`** gained `line_numbers`/`relative_line_numbers` (parsed, stored, not yet rendered - the gutter itself is a follow-up).
 
-## 3. Notes / known quirks
+### 2.11 Renamed to dede
+`README.md`, `doc/` (new), `src/main.c`, `src/app.c`, `build.sh`, `build_msvc.bat`, `build_msys2_mingw64.sh`, `.gitignore`, `.github/workflows/ci.yml`
 
-- Undo/redo place the caret at the start (undo) or end (redo) of the change; exact caret restoration is not implemented.
-- Grouping is time-based (500 ms): a long continuous typing burst without any movement key is still a single undo step.
-- `SDL_GetTicks()` returns 0 until `SDL_INIT_TIMER` is initialized — headless tests must init the timer for the merge window to behave realistically.
-- `editor_clipboard_copy/cut/paste` go through SDL's system clipboard (`SDL_Set/GetClipboardText`), which needs the video subsystem initialized to work reliably — `tes_motion.c` runs with no `SDL_Init` at all, so its yank/paste round-trip check is skipped (not failed) if the clipboard isn't actually functional in that environment. Delete and change are verified independently of whether the copy half succeeds.
-
-## 4. What is left (roadmap, in rough priority order)
-
-1. ~~**Unsaved-changes prompt**~~ / ~~**Save-as / new-file dialog**~~ — done, see §2.6.
-2. ~~**Config**~~ — font path, tab width, keybinding overrides, and Vim on/off all done, see §2.8/§2.10. Theme/color config and the line-number gutter are the missing pieces (below).
-3. **Line-number gutter rendering** — `Config`/`Editor` already have `line_numbers`/`relative_line_numbers` (§2.10); the actual gutter drawing in `editor_render` (plus its effect on cursor/camera math) is the remaining piece.
-4. **Status bar** — line:col, filename, dirty indicator (a permanent one — §2.6's bottom bar only appears for prompts/errors, not standing status), adjustable horizontal scroll.
-5. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
-6. **File-browser search** — type to filter the file list (TODO in `src/main.c`).
-7. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
-8. **Editing polish** — delete word, replace.
-9. **Multiple buffers / tabs**, split view, project-wide search, git integration.
-10. **Mouse support** — click to place cursor, wheel scroll, drag to select.
-11. **Theme/color config** — background, selection, syntax-highlight, and UI-bar colors are still hardcoded hex literals in `editor.c`/`app.c`; a natural next slice of the config file.
-12. **Plugin/scripting layer** — deliberately not started: `command_register`/`keymap_bind` (§2.8) are the seam it would attach to (a script registers its own commands and binds keys to them, the same way `app.c`'s own defaults do), and §2.10's `vim_enabled` pattern is the model for making a scripting layer itself optional/toggleable too - but there's no embedded language yet. Lua is the natural choice if/when this is worth doing (small, fast, trivial to vendor, and the proven model for exactly this kind of editor).
-
-### 4.1 Vim modal editing — what's left (see `src/vim.h`'s header comment for the authoritative scope notes)
-
-1. ~~**Counts**~~ / ~~**Visual mode**~~ — done, see §2.9.
-2. **Text objects** — `iw`, `aw`, `ci(`, `di"`, etc. Needs a notion of "object under cursor", not just "motion from cursor".
-3. **Linewise motions composed with operators** — `dj`, `dk`, `dgg`, `dG`. Blocked on generalizing `vim_resolve_motion` (currently only single `(buffer, pos) -> pos` motions) to express linewise ranges.
-4. **Registers** — named (`"ay`) and numbered, instead of always going through the one system clipboard.
-5. **Authentic linewise put** — `p`/`P` after a linewise yank should insert a new line below/above, not paste charwise at the cursor.
-6. **Command-line mode** — `:w`, `:q`, `:%s/.../.../`.
-7. **Macros and marks** — `qa...q`, `@a`, `` ` ``/`'`.
-8. **A real Vim word model** — `w`/`b`/`e` currently use this codebase's existing alnum-vs-everything-else split; real Vim distinguishes punctuation runs from word runs too.
-9. **Sticky column for `j`/`k`** — see the "known quirks" note above; matters more once Vim's vertical motions are counted/composed.
-
-## 5. TODOs still in the code
-
-From `src/main.c` and elsewhere:
-
-- Font path is hardcoded; no user customization.
-- Search does not auto-fill from the current selection.
-- File browser has no incremental search.
-- `fb->dir_path` grows indefinitely if you navigate up at the root (`src/file_browser.c`).
-- No trailing-whitespace stripping / auto-save.
-- `type_of_file()` is unimplemented on Windows (`#error`), and the MSVC CI job is disabled (#29).
+- Project renamed from `ded` ("Dramatic EDitor") to **dede** ("Dramatically Expanded Dramatic Editor") to reflect that this is now a personal, actively-expanded fork rather than upstream `ded` itself. Binary name, window title, and config filename (`dede.conf`) all follow.
+- This changelog, the roadmap, and known-quirks/TODO notes moved out of the repo-root `PROGRESS.md` into `doc/` (`CHANGELOG.md`, `ROADMAP.md`, `NOTES.md`), so project docs have a real home instead of one growing file.
