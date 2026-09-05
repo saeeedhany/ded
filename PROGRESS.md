@@ -89,6 +89,15 @@ Architectural groundwork, not a user-facing feature by itself: `main.c`'s ~240-l
 - One accepted, narrow behavior change from the refactor itself: Escape's Shift-extends-selection handling now runs *before* `editor_stop_search` instead of after (the dispatcher always resolves shift first, generically), so `editor_update_selection`'s own `if (e->searching) return` guard can now suppress it in the specific case of Shift+Escape pressed while both searching and holding a selection. A zero-argument command can't reproduce ordering that depends on the specific event that resolved to it; this combination was judged too obscure to be worth breaking that abstraction over.
 - `./ded.conf` (repo/cwd-relative — not yet an XDG-style user config path, a natural follow-up) is loaded unconditionally at startup; `font`, `tab_width`, and arbitrary `bind` overrides are all it understands so far. Colors/theming are not configurable yet.
 
+### 2.9 Two more bugs, and counts + Visual mode
+`src/main.c`, `src/vim.c`, `src/vim.h`, `src/tes_motion.c`
+
+- New file / opening a file from the browser reset the buffer but not Vim's own state, so it could enter the fresh buffer still in Insert mode if you hadn't pressed Escape first. Both now reset `vim` via `vim_state_init()`.
+- Comments across the last few commits had grown too verbose; trimmed throughout, going forward capped at ~2 lines and only where genuinely non-obvious.
+- **Counts**: digits accumulate in `Vim_State::count`, cleared once a motion/operator consumes them. Works with motions (`5j`, `3w`), operators (`3dd`, `d3w`, and `2d3w` which multiplies), and `x`; `5G`/`5gg` jump to an absolute line number instead of buffer start/end.
+- **Visual mode**: `v`/`V` (charwise/linewise) reuse the editor's existing selection mechanism directly — entering Visual just anchors `select_begin` at the cursor, and every motion moves `e->cursor` as normal, so the selection grows for free. `d`/`x`/`c`/`y` act on the current selection (Visual's charwise selection is inclusive of both ends, unlike a motion's usual exclusive end); `v`/`V` toggle mode or exit; Escape exits without changing the buffer. Arrow-key movement in Visual mode needed one change in `main.c`: `shift_extends_selection` commands now also extend when `vim.mode == VIM_MODE_VISUAL`, not just on an actual Shift press, so plain arrows don't clear the selection while in Visual mode.
+- Not done: counts don't apply to Visual-mode operators, entering Visual with a count, or `i`-with-count (real Vim repeats the insertion); text objects; `dj`/`dgg`/`dG` still unsupported (same pre-existing limit as before, see `vim.h`).
+
 ## 3. Notes / known quirks
 
 - Undo/redo place the caret at the start (undo) or end (redo) of the change; exact caret restoration is not implemented.
@@ -112,16 +121,15 @@ Architectural groundwork, not a user-facing feature by itself: `main.c`'s ~240-l
 
 ### 4.1 Vim modal editing — what's left (see `src/vim.h`'s header comment for the authoritative scope notes)
 
-1. **Counts** — `3dw`, `5j`, `2yy`. Currently every command acts on exactly one motion/line.
-2. **Visual mode** — select-by-motion (`v`, `V`), then apply an operator to the selection instead of a fresh motion.
-3. **Text objects** — `iw`, `aw`, `ci(`, `di"`, etc. Needs a notion of "object under cursor", not just "motion from cursor".
-4. **Linewise motions composed with operators** — `dj`, `dk`, `dgg`, `dG`. Blocked on generalizing `vim_resolve_motion` (currently only single `(buffer, pos) -> pos` motions) to express linewise ranges.
-5. **Registers** — named (`"ay`) and numbered, instead of always going through the one system clipboard.
-6. **Authentic linewise put** — `p`/`P` after a linewise yank should insert a new line below/above, not paste charwise at the cursor.
-7. **Command-line mode** — `:w`, `:q`, `:%s/.../.../`.
-8. **Macros and marks** — `qa...q`, `@a`, `` ` ``/`'`.
-9. **A real Vim word model** — `w`/`b`/`e` currently use this codebase's existing alnum-vs-everything-else split; real Vim distinguishes punctuation runs from word runs too.
-10. **Sticky column for `j`/`k`** — see the "known quirks" note above; matters more once Vim's vertical motions are counted/composed.
+1. ~~**Counts**~~ / ~~**Visual mode**~~ — done, see §2.9.
+2. **Text objects** — `iw`, `aw`, `ci(`, `di"`, etc. Needs a notion of "object under cursor", not just "motion from cursor".
+3. **Linewise motions composed with operators** — `dj`, `dk`, `dgg`, `dG`. Blocked on generalizing `vim_resolve_motion` (currently only single `(buffer, pos) -> pos` motions) to express linewise ranges.
+4. **Registers** — named (`"ay`) and numbered, instead of always going through the one system clipboard.
+5. **Authentic linewise put** — `p`/`P` after a linewise yank should insert a new line below/above, not paste charwise at the cursor.
+6. **Command-line mode** — `:w`, `:q`, `:%s/.../.../`.
+7. **Macros and marks** — `qa...q`, `@a`, `` ` ``/`'`.
+8. **A real Vim word model** — `w`/`b`/`e` currently use this codebase's existing alnum-vs-everything-else split; real Vim distinguishes punctuation runs from word runs too.
+9. **Sticky column for `j`/`k`** — see the "known quirks" note above; matters more once Vim's vertical motions are counted/composed.
 
 ## 5. TODOs still in the code
 

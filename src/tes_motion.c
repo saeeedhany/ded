@@ -365,6 +365,131 @@ int main(void)
                (int) o.data.count, o.data.items);
     }
 
+    printf("\n--- vim counts ---\n");
+
+    RESET_OP_TEST("hello world");
+    vim_handle_key(&ov, &o, KEY(SDLK_5));
+    vim_handle_key(&ov, &o, KEY(SDLK_l));
+    CHECK_EQ("'5l' moves right 5 chars", o.cursor, 5);
+    CHECK_EQ("count resets after being consumed", ov.count, 0);
+
+    RESET_OP_TEST("one two three four");
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_w));
+    CHECK_EQ("'3w' moves 3 words forward", o.cursor, 13);
+
+    RESET_OP_TEST("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11");
+    vim_handle_key(&ov, &o, KEY(SDLK_1));
+    vim_handle_key(&ov, &o, KEY(SDLK_0));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_EQ("'10j' (multi-digit count) moves down 10 lines", o.cursor, 30);
+
+    RESET_OP_TEST("one two three four");
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_w));
+    CHECK_STR("'3dw' deletes through 3 words", o.data.items, o.data.count, " four");
+
+    RESET_OP_TEST("one two three four");
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_w));
+    CHECK_STR("'d3w' deletes through 3 words", o.data.items, o.data.count, " four");
+
+    RESET_OP_TEST("a b c d e f g h");
+    vim_handle_key(&ov, &o, KEY(SDLK_2));
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_w));
+    CHECK_STR("'2d3w' multiplies counts (deletes 6 words)", o.data.items, o.data.count, " g h");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour");
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    CHECK_STR("'3dd' deletes 3 lines", o.data.items, o.data.count, "four");
+
+    RESET_OP_TEST("hello");
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_x));
+    CHECK_STR("'3x' deletes 3 chars", o.data.items, o.data.count, "lo");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY_SHIFT(SDLK_g));
+    CHECK_EQ("'3G' jumps to line 3", o.cursor, 8);
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    CHECK_EQ("'3gg' jumps to line 3", o.cursor, 8);
+
+    printf("\n--- vim visual mode ---\n");
+
+    RESET_OP_TEST("hello world");
+    vim_handle_key(&ov, &o, KEY(SDLK_v));
+    if (ov.mode != VIM_MODE_VISUAL) { printf("FAIL: 'v' should enter Visual mode\n"); failures++; }
+    else printf("ok:   'v' enters Visual mode\n");
+    if (!o.selection) { printf("FAIL: 'v' should start a selection anchored at the cursor\n"); failures++; }
+    else printf("ok:   'v' starts a selection anchored at the cursor\n");
+
+    vim_handle_key(&ov, &o, KEY(SDLK_l));
+    vim_handle_key(&ov, &o, KEY(SDLK_l));
+    vim_handle_key(&ov, &o, KEY(SDLK_l));
+    vim_handle_key(&ov, &o, KEY(SDLK_x));
+    CHECK_STR("Visual 'lllx' deletes the 4 selected chars (inclusive)", o.data.items, o.data.count, "o world");
+    if (ov.mode != VIM_MODE_NORMAL) { printf("FAIL: deleting a Visual selection should return to Normal mode\n"); failures++; }
+    else printf("ok:   deleting a Visual selection returns to Normal mode\n");
+    if (o.selection) { printf("FAIL: deleting a Visual selection should clear it\n"); failures++; }
+    else printf("ok:   deleting a Visual selection clears it\n");
+
+    RESET_OP_TEST("one two three");
+    vim_handle_key(&ov, &o, KEY(SDLK_v));
+    vim_handle_key(&ov, &o, KEY(SDLK_w));
+    vim_handle_key(&ov, &o, KEY(SDLK_y));
+    CHECK_STR("Visual yank does not modify the buffer", o.data.items, o.data.count, "one two three");
+    CHECK_EQ("Visual yank leaves cursor at the selection start", o.cursor, 0);
+    if (ov.mode != VIM_MODE_NORMAL) { printf("FAIL: yanking a Visual selection should return to Normal mode\n"); failures++; }
+    else printf("ok:   yanking a Visual selection returns to Normal mode\n");
+
+    RESET_OP_TEST("hello world");
+    vim_handle_key(&ov, &o, KEY(SDLK_v));
+    vim_handle_key(&ov, &o, KEY(SDLK_e));
+    vim_handle_key(&ov, &o, KEY(SDLK_c));
+    CHECK_STR("Visual change deletes the selection", o.data.items, o.data.count, " world");
+    if (ov.mode != VIM_MODE_INSERT) { printf("FAIL: Visual 'c' should enter Insert mode\n"); failures++; }
+    else printf("ok:   Visual change enters Insert mode\n");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour");
+    o.cursor = 5; // inside "two"
+    vim_handle_key(&ov, &o, KEY_SHIFT(SDLK_v));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    CHECK_STR("Visual-line 'Vjd' deletes 2 whole lines", o.data.items, o.data.count, "one\nfour");
+
+    RESET_OP_TEST("hello world");
+    vim_handle_key(&ov, &o, KEY(SDLK_v));
+    vim_handle_key(&ov, &o, KEY(SDLK_l));
+    vim_handle_key(&ov, &o, KEY(SDLK_ESCAPE));
+    CHECK_STR("Escape in Visual mode leaves the buffer untouched", o.data.items, o.data.count, "hello world");
+    if (ov.mode != VIM_MODE_NORMAL) { printf("FAIL: Escape should return to Normal mode from Visual\n"); failures++; }
+    else printf("ok:   Escape returns to Normal mode from Visual\n");
+    if (o.selection) { printf("FAIL: Escape from Visual should clear the selection\n"); failures++; }
+    else printf("ok:   Escape from Visual clears the selection\n");
+
+    RESET_OP_TEST("hello world");
+    vim_handle_key(&ov, &o, KEY(SDLK_v));
+    vim_handle_key(&ov, &o, KEY(SDLK_v));
+    if (ov.mode != VIM_MODE_NORMAL) { printf("FAIL: pressing 'v' again should toggle Visual mode off\n"); failures++; }
+    else printf("ok:   pressing 'v' again toggles Visual mode off\n");
+
+    RESET_OP_TEST("hello world");
+    vim_handle_key(&ov, &o, KEY_SHIFT(SDLK_v));
+    vim_handle_key(&ov, &o, KEY(SDLK_v));
+    if (ov.mode != VIM_MODE_VISUAL || ov.visual_linewise) { printf("FAIL: 'v' after 'V' should switch to charwise, staying in Visual\n"); failures++; }
+    else printf("ok:   'v' after 'V' switches Visual mode to charwise\n");
+
     if (failures == 0) {
         printf("\nALL CHECKS PASSED\n");
         return 0;

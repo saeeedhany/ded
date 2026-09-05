@@ -128,6 +128,8 @@ static void perform_action(Confirm_Action action)
         break;
     case CONFIRM_ACTION_NEW_FILE:
         editor_new_file(&editor);
+        vim = vim_state_init();
+        editor.cursor_block = true;
         mode = APP_MODE_EDITOR;
         break;
     case CONFIRM_ACTION_QUIT:
@@ -743,17 +745,13 @@ int main(int argc, char **argv)
                                 break;
 
                                 case FT_REGULAR: {
-                                    // Unsaved-changes confirmation already
-                                    // happened before we could even get into
-                                    // the file browser (see F3's
-                                    // request_action call below) - nothing
-                                    // edits the buffer while this mode is
-                                    // active, so there's nothing new to lose
-                                    // by loading over it here.
+                                    // F3 already confirmed discarding unsaved changes.
                                     err = editor_load_from_file(&editor, file_path);
                                     if (err != 0) {
                                         flash_error("Could not open file %s: %s", file_path, strerror(err));
                                     } else {
+                                        vim = vim_state_init();
+                                        editor.cursor_block = true;
                                         mode = APP_MODE_EDITOR;
                                     }
                                 }
@@ -838,7 +836,8 @@ int main(int argc, char **argv)
                         const Command *cmd = keymap_resolve(event.key.keysym);
                         if (cmd != NULL) {
                             if (cmd->shift_extends_selection) {
-                                editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
+                                bool extend = (event.key.keysym.mod & KMOD_SHIFT) || vim.mode == VIM_MODE_VISUAL;
+                                editor_update_selection(&editor, extend);
                             }
                             cmd->fn();
                         }
@@ -879,18 +878,9 @@ int main(int argc, char **argv)
 
                 case APP_MODE_EDITOR:
                     if (vim_take_consumed_textinput(&vim)) {
-                        // vim_handle_key just claimed the SDL_KEYDOWN this
-                        // SDL_TEXTINPUT belongs to (even if that command, like
-                        // 'i', switched us to Insert mode) - swallow it so the
-                        // command letter doesn't also get typed into the buffer.
-                    } else if (!editor.searching && vim.mode == VIM_MODE_NORMAL) {
-                        // Normal mode: letters not (yet) bound to a command are
-                        // still not text - swallow them too rather than typing
-                        // them. Not while searching, though: vim_handle_key steps
-                        // aside entirely then (see vim.c), so this event is the
-                        // search query being typed and must reach editor_insert_buf
-                        // below, which routes it into e->search instead of the
-                        // document.
+                        // key already claimed by vim_handle_key; don't also type it
+                    } else if (!editor.searching && (vim.mode == VIM_MODE_NORMAL || vim.mode == VIM_MODE_VISUAL)) {
+                        // unbound letters in these modes are commands, not text
                     } else {
                         const char *text = event.text.text;
                         size_t text_len = strlen(text);

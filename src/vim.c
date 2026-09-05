@@ -6,6 +6,9 @@ Vim_State vim_state_init(void)
         .mode = VIM_MODE_NORMAL,
         .pending_g = false,
         .pending_op = VIM_OP_NONE,
+        .count = 0,
+        .pending_op_count = 0,
+        .visual_linewise = false,
         .consumed_textinput = false,
     };
 }
@@ -30,24 +33,45 @@ static void vim_enter_normal(Vim_State *vs, Editor *e)
     vs->pending_op = VIM_OP_NONE;
     e->cursor_block = true;
 
-    // Vim convention: leaving Insert mode steps the cursor back one
-    // column (but never past the start of the line), so it lands ON the
-    // last character you typed instead of one past it.
+    // Leaving Insert steps the cursor back one column (never past line start).
     size_t line_begin = editor_find_line_begin(e, e->cursor);
     if (e->cursor > line_begin) {
         e->cursor = editor_find_char_left(e, e->cursor);
     }
 }
 
-// ------------------------------------------------------------------------
-// Range primitives
-//
-// Everything below drives the editor's existing selection + clipboard
-// machinery instead of reimplementing delete/yank/put: set up a
-// [begin, end) range as a selection, then call the same
-// editor_clipboard_copy/cut/paste the mouse-selection and Ctrl+C/X/V
-// paths already use.
-// ------------------------------------------------------------------------
+static void vim_exit_visual(Vim_State *vs, Editor *e)
+{
+    vs->mode = VIM_MODE_NORMAL;
+    vs->visual_linewise = false;
+    e->selection = false;
+    e->cursor_block = true;
+}
+
+static void vim_accumulate_count(Vim_State *vs, size_t digit)
+{
+    vs->count = vs->count * 10 + digit;
+    if (vs->count > 100000) vs->count = 100000;
+}
+
+static size_t vim_line_pos(const Editor *e, size_t line_number)
+{
+    size_t row = line_number - 1;
+    if (row >= e->lines.count) row = e->lines.count - 1;
+    return e->lines.items[row].begin;
+}
+
+static void vim_goto_begin_or_line(Editor *e, size_t line_number)
+{
+    if (line_number > 0) e->cursor = vim_line_pos(e, line_number);
+    else editor_move_to_begin(e);
+}
+
+static void vim_goto_end_or_line(Editor *e, size_t line_number)
+{
+    if (line_number > 0) e->cursor = vim_line_pos(e, line_number);
+    else editor_move_to_end(e);
+}
 
 static void vim_select_range(Editor *e, size_t begin, size_t end)
 {
@@ -59,7 +83,7 @@ static void vim_select_range(Editor *e, size_t begin, size_t end)
 static void vim_delete_range(Editor *e, size_t begin, size_t end)
 {
     vim_select_range(e, begin, end);
-    editor_clipboard_cut(e); // copies then deletes; leaves e->cursor == begin
+    editor_clipboard_cut(e); // leaves e->cursor == begin
 }
 
 static void vim_yank_range(Editor *e, size_t begin, size_t end)
@@ -67,79 +91,82 @@ static void vim_yank_range(Editor *e, size_t begin, size_t end)
     vim_select_range(e, begin, end);
     editor_clipboard_copy(e);
     e->selection = false;
-    e->cursor = begin; // Vim leaves the cursor at the start of what was yanked
+    e->cursor = begin;
 }
 
-// Range for 'dd'/'yy' on the line containing `pos`: the whole line
-// INCLUDING its trailing newline, so deleting it removes the line
-// entirely rather than leaving a blank one behind - except the buffer's
-// very last line, which has no trailing newline of its own to take (it
-// eats the *previous* line's newline instead), and the buffer's only
-// line, which has no newline to take at all and is just cleared.
-static void vim_linewise_range(const Editor *e, size_t pos, size_t *out_begin, size_t *out_end)
+// [begin, end) for 'dd'/'yy' with `count` lines from the one containing
+// `pos`, newline included so the lines are fully removed - except the
+// buffer's last line, which eats the *previous* line's newline instead
+// since it has none of its own.
+static void vim_linewise_range_n(const Editor *e, size_t pos, size_t count, size_t *out_begin, size_t *out_end)
 {
+    if (count == 0) count = 1;
     size_t row = editor_row_at(e, pos);
-    Line line = e->lines.items[row];
-    if (row + 1 < e->lines.count) {
-        *out_begin = line.begin;
-        *out_end = e->lines.items[row + 1].begin;
+    size_t last_row = row + count - 1;
+    if (last_row >= e->lines.count) last_row = e->lines.count - 1;
+
+    if (last_row + 1 < e->lines.count) {
+        *out_begin = e->lines.items[row].begin;
+        *out_end = e->lines.items[last_row + 1].begin;
     } else if (row > 0) {
         *out_begin = e->lines.items[row - 1].end;
-        *out_end = line.end;
+        *out_end = e->lines.items[last_row].end;
     } else {
-        *out_begin = line.begin;
-        *out_end = line.end;
+        *out_begin = e->lines.items[row].begin;
+        *out_end = e->lines.items[last_row].end;
     }
 }
 
-// Range for 'cc' on the line containing `pos`: just the line's content,
-// EXCLUDING any newline - unlike 'dd', changing a line must leave it in
-// place (and the buffer's line count unchanged) so the cursor lands on a
-// still-existing blank line ready for new text, rather than merging it
-// into its neighbor the way consuming a newline would.
-static void vim_line_content_range(const Editor *e, size_t pos, size_t *out_begin, size_t *out_end)
+// [begin, end) for 'cc': `count` lines' content merged into one,
+// excluding the newline after the last of them (unlike dd, cc keeps a line).
+static void vim_line_content_range_n(const Editor *e, size_t pos, size_t count, size_t *out_begin, size_t *out_end)
 {
-    Line line = e->lines.items[editor_row_at(e, pos)];
-    *out_begin = line.begin;
-    *out_end = line.end;
+    if (count == 0) count = 1;
+    size_t row = editor_row_at(e, pos);
+    size_t last_row = row + count - 1;
+    if (last_row >= e->lines.count) last_row = e->lines.count - 1;
+    *out_begin = e->lines.items[row].begin;
+    *out_end = e->lines.items[last_row].end;
 }
 
-// Maps a Normal-mode motion key to the position it moves to, for reuse by
-// both plain cursor movement and operator-pending range resolution below
-// - one mapping, two consumers, so a motion added here works in both
-// immediately. `shift` matters only for '0' (never) and '$' (always);
-// h/l/w/b/e ignore it, matching this file's pre-existing plain-movement
-// behavior. `*out_inclusive` says whether the char the motion lands ON is
-// itself part of an operator's range (true for `e`/`$`, matching Vim's
-// inclusive-motion rules; plain movement ignores it).
-//
-// Scope: only motions expressible as a single (buffer, pos) -> pos call
-// with no line-boundary bookkeeping. j/k/gg/G stay hand-rolled in
-// vim_dispatch_key's switch and are movement-only for now - not usable
-// with a pending operator (dj, dgg, dG), since a correct linewise range
-// needs more than this simple model gives.
-static bool vim_resolve_motion(const Editor *e, SDL_Keysym key, bool shift, size_t *out_pos, bool *out_inclusive)
+// Same idea, but for an already-known [begin, end) span (Visual linewise).
+static void vim_visual_linewise_range(const Editor *e, size_t begin, size_t end, size_t *out_begin, size_t *out_end)
+{
+    size_t row_begin = editor_row_at(e, begin);
+    size_t row_end = editor_row_at(e, end);
+    *out_begin = e->lines.items[row_begin].begin;
+    if (row_end + 1 < e->lines.count) {
+        *out_end = e->lines.items[row_end + 1].begin;
+    } else {
+        *out_end = e->lines.items[row_end].end;
+    }
+}
+
+// (buffer, pos) -> pos for a single motion key. `shift` matters only
+// for '0' (never) and '$' (always). `*out_inclusive` says whether the
+// landing char is itself part of an operator's range (true for e/$).
+static bool vim_resolve_motion(const Editor *e, SDL_Keysym key, bool shift, size_t pos, size_t *out_pos, bool *out_inclusive)
 {
     *out_inclusive = false;
     switch (key.sym) {
-    case SDLK_h: *out_pos = editor_find_char_left(e, e->cursor);  return true;
-    case SDLK_l: *out_pos = editor_find_char_right(e, e->cursor); return true;
-    case SDLK_w: *out_pos = editor_find_word_right(e, e->cursor); return true;
-    case SDLK_b: *out_pos = editor_find_word_left(e, e->cursor);  return true;
+    case SDLK_h: *out_pos = editor_find_char_left(e, pos);  return true;
+    case SDLK_l: *out_pos = editor_find_char_right(e, pos); return true;
+    case SDLK_w: *out_pos = editor_find_word_right(e, pos); return true;
+    case SDLK_b: *out_pos = editor_find_word_left(e, pos);  return true;
 
     case SDLK_e:
-        *out_pos = editor_find_word_end(e, e->cursor);
+        *out_pos = editor_find_word_end(e, pos);
         *out_inclusive = true;
         return true;
 
     case SDLK_0:
         if (shift) return false;
-        *out_pos = editor_find_line_begin(e, e->cursor);
+        *out_pos = editor_find_line_begin(e, pos);
         return true;
 
-    case SDLK_4: // Shift+4 == '$' on a US layout.
+    case SDLK_4: // Shift+4 == '$'
         if (!shift) return false;
-        *out_pos = editor_find_line_end(e, e->cursor);
+        *out_pos = editor_find_line_end(e, pos);
         *out_inclusive = true;
         return true;
 
@@ -148,44 +175,93 @@ static bool vim_resolve_motion(const Editor *e, SDL_Keysym key, bool shift, size
     }
 }
 
-// 'x': delete the single character under the cursor (never the line's
-// own newline - Vim's `x` on an empty, or already-at-end, line is a
-// no-op).
-static void vim_delete_char_under_cursor(Editor *e)
+static bool vim_resolve_motion_n(const Editor *e, SDL_Keysym key, bool shift, size_t count, size_t *out_pos, bool *out_inclusive)
 {
-    size_t line_end = editor_find_line_end(e, e->cursor);
-    if (e->cursor >= line_end) return;
-    vim_delete_range(e, e->cursor, editor_find_char_right(e, e->cursor));
+    if (count == 0) count = 1;
+    size_t pos = e->cursor;
+    bool inclusive = false;
+    for (size_t i = 0; i < count; ++i) {
+        size_t next;
+        if (!vim_resolve_motion(e, key, shift, pos, &next, &inclusive)) return false;
+        pos = next;
+    }
+    *out_pos = pos;
+    *out_inclusive = inclusive;
+    return true;
 }
 
-// 'D': delete from the cursor to the end of the current line.
+// h/l/w/b/e/0/$/j/k with the pending count applied - shared by Normal
+// and Visual dispatch. gg/G aren't here: their two-key/count-as-line-
+// number shape doesn't fit "resolve one target position".
+static bool vim_try_movement(Vim_State *vs, Editor *e, SDL_Keysym key, bool shift, size_t *out_pos)
+{
+    switch (key.sym) {
+    case SDLK_h:
+    case SDLK_l:
+    case SDLK_w:
+    case SDLK_b:
+    case SDLK_e:
+    case SDLK_0:
+    case SDLK_4: {
+        bool inclusive;
+        return vim_resolve_motion_n(e, key, shift, vs->count, out_pos, &inclusive);
+    }
+
+    case SDLK_j: {
+        size_t pos = e->cursor;
+        size_t count = vs->count ? vs->count : 1;
+        for (size_t i = 0; i < count; ++i) pos = editor_find_line_down(e, pos);
+        *out_pos = pos;
+        return true;
+    }
+
+    case SDLK_k: {
+        size_t pos = e->cursor;
+        size_t count = vs->count ? vs->count : 1;
+        for (size_t i = 0; i < count; ++i) pos = editor_find_line_up(e, pos);
+        *out_pos = pos;
+        return true;
+    }
+
+    default:
+        return false;
+    }
+}
+
+static void vim_delete_char_under_cursor(Editor *e, size_t count)
+{
+    if (count == 0) count = 1;
+    size_t begin = e->cursor;
+    size_t line_end = editor_find_line_end(e, begin);
+    if (begin >= line_end) return;
+    size_t end = begin;
+    for (size_t i = 0; i < count && end < line_end; ++i) {
+        end = editor_find_char_right(e, end);
+    }
+    vim_delete_range(e, begin, end);
+}
+
 static void vim_delete_to_line_end(Editor *e)
 {
     size_t end = editor_find_line_end(e, e->cursor);
     if (e->cursor < end) vim_delete_range(e, e->cursor, end);
 }
 
-// 'C': same range as 'D', then drop into Insert mode right where the
-// deleted text was - Vim's "change" convention.
 static void vim_change_to_line_end(Vim_State *vs, Editor *e)
 {
     vim_delete_to_line_end(e);
     vim_enter_insert(vs, e);
 }
 
-// 'Y': yank the whole current line (Vim treats capital Y as an alias for
-// `yy`, not "yank to end of line" the way D/C work for delete/change).
 static void vim_yank_line(Editor *e)
 {
     size_t begin, end;
-    vim_linewise_range(e, e->cursor, &begin, &end);
+    vim_linewise_range_n(e, e->cursor, 1, &begin, &end);
     vim_yank_range(e, begin, end);
 }
 
-// 'p' pastes after the cursor (Vim's charwise put), 'P' before it. The
-// clipboard here is charwise-only (no linewise register flag), so both
-// just insert the system clipboard's text at a cursor position rather
-// than reproducing Vim's linewise put-a-whole-line-below/above behavior.
+// p/P: charwise put only - the clipboard has no linewise flag, so both
+// just insert at a cursor position rather than a new line below/above.
 static void vim_paste(Editor *e, bool after)
 {
     if (after && e->cursor < e->data.count) {
@@ -194,11 +270,9 @@ static void vim_paste(Editor *e, bool after)
     editor_clipboard_paste(e);
 }
 
-// Finishes whatever operator is pending against [begin, end) (order does
-// not matter - callers may pass either endpoint first). Delete/change
-// treat an empty range as "nothing to delete" rather than skipping the
-// operator entirely, since `cc`/`cw` on an empty line must still drop
-// into Insert mode with nothing to remove first.
+// Finishes the pending operator against [begin, end) (order doesn't
+// matter). Delete/change treat an empty range as "nothing to delete",
+// not "skip the operator" - cc/cw on an empty line still enters Insert.
 static void vim_apply_pending_op(Vim_State *vs, Editor *e, size_t begin, size_t end)
 {
     if (begin > end) SWAP(size_t, begin, end);
@@ -226,13 +300,22 @@ static void vim_apply_pending_op(Vim_State *vs, Editor *e, size_t begin, size_t 
     }
 }
 
-// Resolves the second key of a pending d/c/y: either the operator's own
-// letter again (linewise dd/cc/yy), a recognized motion (charwise range),
-// or - Escape aside - anything else, which cancels the operator the way
-// Vim silently drops an unrecognized operator-pending key. Always called
-// with vs->pending_op != VIM_OP_NONE.
-static bool vim_dispatch_pending_op(Vim_State *vs, Editor *e, SDL_Keysym key, bool shift)
+static bool vim_dispatch_pending_op(Vim_State *vs, Editor *e, SDL_Keysym key, bool shift, bool ctrl)
 {
+    if (ctrl) {
+        vs->pending_op = VIM_OP_NONE;
+        vs->count = 0;
+        vs->pending_op_count = 0;
+        return false;
+    }
+
+    if (!shift && key.sym >= SDLK_0 && key.sym <= SDLK_9 && !(key.sym == SDLK_0 && vs->count == 0)) {
+        vim_accumulate_count(vs, key.sym - SDLK_0);
+        return true;
+    }
+
+    size_t total_count = (vs->pending_op_count ? vs->pending_op_count : 1) * (vs->count ? vs->count : 1);
+
     bool is_same_letter =
         (vs->pending_op == VIM_OP_DELETE && key.sym == SDLK_d && !shift) ||
         (vs->pending_op == VIM_OP_CHANGE && key.sym == SDLK_c && !shift) ||
@@ -240,93 +323,187 @@ static bool vim_dispatch_pending_op(Vim_State *vs, Editor *e, SDL_Keysym key, bo
     if (is_same_letter) {
         size_t begin, end;
         if (vs->pending_op == VIM_OP_CHANGE) {
-            vim_line_content_range(e, e->cursor, &begin, &end); // 'cc': keep the line, clear its content
+            vim_line_content_range_n(e, e->cursor, total_count, &begin, &end);
         } else {
-            vim_linewise_range(e, e->cursor, &begin, &end); // 'dd'/'yy': whole line + newline
+            vim_linewise_range_n(e, e->cursor, total_count, &begin, &end);
         }
+        vs->count = 0;
+        vs->pending_op_count = 0;
         vim_apply_pending_op(vs, e, begin, end);
         return true;
     }
 
     size_t target;
     bool inclusive;
-    if (vim_resolve_motion(e, key, shift, &target, &inclusive)) {
+    if (vim_resolve_motion_n(e, key, shift, total_count, &target, &inclusive)) {
         size_t begin = e->cursor, end = target;
         if (begin > end) SWAP(size_t, begin, end);
         if (inclusive && end < e->data.count) end += 1;
+        vs->count = 0;
+        vs->pending_op_count = 0;
         vim_apply_pending_op(vs, e, begin, end);
         return true;
     }
 
-    if (key.sym == SDLK_ESCAPE) {
-        vs->pending_op = VIM_OP_NONE;
-        // Don't consume: let main.c's existing Escape handling still run
-        // too (flush undo group, clear selection), same as Insert mode's
-        // Escape handling above.
-        return false;
-    }
-
-    // Any other key: cancel the pending operator without doing anything
-    // else with it this keypress, same as Vim waiting-then-dropping an
-    // unbound operator-pending key.
     vs->pending_op = VIM_OP_NONE;
+    vs->count = 0;
+    vs->pending_op_count = 0;
+    if (key.sym == SDLK_ESCAPE) return false; // let main.c's own Escape handling still run
     return true;
 }
 
-// Actual key dispatch, split out of vim_handle_key so the public entry
-// point can uniformly record consumed_textinput around every return
-// path below (including the ones that switch mode) without repeating
-// that bookkeeping at each `return`.
+// Delete/change/yank the current Visual selection, then leave Visual
+// mode - except for change, which drops into Insert instead.
+static void vim_visual_apply(Vim_State *vs, Editor *e, Vim_Op op)
+{
+    size_t begin = e->select_begin;
+    size_t end = e->cursor;
+    if (begin > end) SWAP(size_t, begin, end);
+
+    if (vs->visual_linewise) {
+        vim_visual_linewise_range(e, begin, end, &begin, &end);
+    } else if (end < e->data.count) {
+        end += 1; // Visual charwise selection is inclusive of its end
+    }
+
+    e->selection = false;
+    vs->visual_linewise = false;
+    vs->pending_op = op;
+    vim_apply_pending_op(vs, e, begin, end);
+
+    if (vs->mode == VIM_MODE_VISUAL) {
+        vs->mode = VIM_MODE_NORMAL;
+        e->cursor_block = true;
+    }
+}
+
+static bool vim_dispatch_visual_key(Vim_State *vs, Editor *e, SDL_Keysym key, bool shift, bool ctrl)
+{
+    if (ctrl) {
+        vs->count = 0;
+        return false;
+    }
+
+    if (!shift && key.sym >= SDLK_0 && key.sym <= SDLK_9 && !(key.sym == SDLK_0 && vs->count == 0)) {
+        vim_accumulate_count(vs, key.sym - SDLK_0);
+        return true;
+    }
+
+    if (vs->pending_g) {
+        vs->pending_g = false;
+        if (key.sym == SDLK_g && !shift) {
+            vim_goto_begin_or_line(e, vs->count);
+            vs->count = 0;
+            return true;
+        }
+    }
+
+    size_t pos;
+    if (vim_try_movement(vs, e, key, shift, &pos)) {
+        e->cursor = pos;
+        vs->count = 0;
+        return true;
+    }
+
+    switch (key.sym) {
+    case SDLK_g:
+        if (shift) {
+            vim_goto_end_or_line(e, vs->count);
+            vs->count = 0;
+        } else {
+            vs->pending_g = true;
+        }
+        return true;
+
+    case SDLK_v:
+        if (shift) {
+            if (vs->visual_linewise) vim_exit_visual(vs, e);
+            else vs->visual_linewise = true;
+        } else {
+            if (!vs->visual_linewise) vim_exit_visual(vs, e);
+            else vs->visual_linewise = false;
+        }
+        vs->count = 0;
+        return true;
+
+    case SDLK_ESCAPE:
+        vim_exit_visual(vs, e);
+        vs->count = 0;
+        return false;
+
+    case SDLK_d:
+    case SDLK_x:
+        if (shift) break;
+        vim_visual_apply(vs, e, VIM_OP_DELETE);
+        vs->count = 0;
+        return true;
+
+    case SDLK_c:
+        if (shift) break;
+        vim_visual_apply(vs, e, VIM_OP_CHANGE);
+        vs->count = 0;
+        return true;
+
+    case SDLK_y:
+        if (shift) break;
+        vim_visual_apply(vs, e, VIM_OP_YANK);
+        vs->count = 0;
+        return true;
+
+    default:
+        break;
+    }
+
+    vs->count = 0;
+    return false;
+}
+
 static bool vim_dispatch_key(Vim_State *vs, Editor *e, SDL_Keysym key)
 {
-    // Vim has no notion of this editor's incremental search - defer to
-    // main.c's existing (already search-aware) key/text handling
-    // entirely while it's active, rather than having Normal-mode
-    // commands like hjkl hijack the search query as it's being typed.
     if (e->searching) return false;
 
     if (vs->mode == VIM_MODE_INSERT) {
-        if (key.sym == SDLK_ESCAPE) {
-            vim_enter_normal(vs, e);
-            // Don't consume: main.c's existing Escape handling still
-            // flushes the undo group, stops search, and clears selection.
-        }
+        if (key.sym == SDLK_ESCAPE) vim_enter_normal(vs, e); // don't consume; main.c's Escape still runs
         return false;
     }
 
-    // vs->mode == VIM_MODE_NORMAL from here down.
     bool shift = key.mod & KMOD_SHIFT;
     bool ctrl  = key.mod & KMOD_CTRL;
 
-    // A pending `g` completes only into `gg`. Any other key cancels the
-    // pending state and is then handled normally below - so `g` followed
-    // by, say, `j` still moves down instead of silently vanishing.
+    if (vs->mode == VIM_MODE_VISUAL) {
+        return vim_dispatch_visual_key(vs, e, key, shift, ctrl);
+    }
+
     if (vs->pending_g) {
         vs->pending_g = false;
         if (key.sym == SDLK_g && !shift && !ctrl) {
-            editor_move_to_begin(e); // gg -> start of buffer (approximates "first line")
+            vim_goto_begin_or_line(e, vs->count);
+            vs->count = 0;
             return true;
         }
-        // fall through: process `key` as an ordinary Normal-mode command
     }
 
-    // Never hijack Ctrl-combinations - undo/redo/copy/cut/paste/select-all
-    // /search all go through main.c's existing mode-agnostic handling.
-    // Also drop any pending operator: Vim abandons d/c/y the same way on
-    // an unrelated Ctrl-combo.
     if (ctrl) {
         vs->pending_op = VIM_OP_NONE;
+        vs->count = 0;
+        vs->pending_op_count = 0;
         return false;
     }
 
+    if (!shift && key.sym >= SDLK_0 && key.sym <= SDLK_9 && !(key.sym == SDLK_0 && vs->count == 0)) {
+        vim_accumulate_count(vs, key.sym - SDLK_0);
+        return true;
+    }
+
     if (vs->pending_op != VIM_OP_NONE) {
-        return vim_dispatch_pending_op(vs, e, key, shift);
+        return vim_dispatch_pending_op(vs, e, key, shift, ctrl);
     }
 
     switch (key.sym) {
     case SDLK_i:
         if (!shift) {
             vim_enter_insert(vs, e);
+            vs->count = 0;
             return true;
         }
         break;
@@ -337,62 +514,84 @@ static bool vim_dispatch_key(Vim_State *vs, Editor *e, SDL_Keysym key)
     case SDLK_b:
     case SDLK_e:
     case SDLK_0:
-    case SDLK_4: {
-        size_t target;
-        bool inclusive;
-        if (vim_resolve_motion(e, key, shift, &target, &inclusive)) {
-            (void) inclusive; // only meaningful to operator-pending ranges
-            e->cursor = target;
+    case SDLK_4:
+    case SDLK_j:
+    case SDLK_k: {
+        size_t pos;
+        if (vim_try_movement(vs, e, key, shift, &pos)) {
+            e->cursor = pos;
+            vs->count = 0;
             return true;
         }
-        break; // e.g. '0' with shift, or '4' without shift: not a motion here
+        break;
     }
-
-    case SDLK_k: editor_move_line_up(e);    return true;
-    case SDLK_j: editor_move_line_down(e);  return true;
 
     case SDLK_g:
         if (shift) {
-            editor_move_to_end(e); // G -> end of buffer (approximates "last line")
+            vim_goto_end_or_line(e, vs->count);
+            vs->count = 0;
         } else {
-            vs->pending_g = true;  // wait for the second g of `gg`
+            vs->pending_g = true;
         }
+        return true;
+
+    case SDLK_v:
+        vs->mode = VIM_MODE_VISUAL;
+        vs->visual_linewise = shift;
+        e->selection = true;
+        e->select_begin = e->cursor;
+        vs->count = 0;
         return true;
 
     case SDLK_x:
         if (!shift) {
-            vim_delete_char_under_cursor(e);
+            vim_delete_char_under_cursor(e, vs->count);
+            vs->count = 0;
             return true;
         }
-        break; // 'X' (delete before cursor) not implemented yet
+        break;
 
     case SDLK_d:
         if (shift) {
-            vim_delete_to_line_end(e); // 'D'
+            vim_delete_to_line_end(e);
+            vs->count = 0;
         } else {
-            vs->pending_op = VIM_OP_DELETE; // 'd': wait for its motion/repeat
+            vs->pending_op_count = vs->count;
+            vs->count = 0;
+            vs->pending_op = VIM_OP_DELETE;
         }
         return true;
 
     case SDLK_c:
         if (shift) {
-            vim_change_to_line_end(vs, e); // 'C'
+            vim_change_to_line_end(vs, e);
+            vs->count = 0;
         } else {
-            vs->pending_op = VIM_OP_CHANGE; // 'c': wait for its motion/repeat
+            vs->pending_op_count = vs->count;
+            vs->count = 0;
+            vs->pending_op = VIM_OP_CHANGE;
         }
         return true;
 
     case SDLK_y:
         if (shift) {
-            vim_yank_line(e); // 'Y' == yy
+            vim_yank_line(e);
+            vs->count = 0;
         } else {
-            vs->pending_op = VIM_OP_YANK; // 'y': wait for its motion/repeat
+            vs->pending_op_count = vs->count;
+            vs->count = 0;
+            vs->pending_op = VIM_OP_YANK;
         }
         return true;
 
     case SDLK_p:
-        vim_paste(e, !shift); // 'p' after cursor, 'P' before
+        vim_paste(e, !shift);
+        vs->count = 0;
         return true;
+
+    case SDLK_ESCAPE:
+        vs->count = 0;
+        break; // let main.c's own Escape command still run
 
     default:
         break;
@@ -403,14 +602,6 @@ static bool vim_dispatch_key(Vim_State *vs, Editor *e, SDL_Keysym key)
 
 bool vim_handle_key(Vim_State *vs, Editor *e, SDL_Keysym key)
 {
-    // Every printable key SDL delivers as SDL_KEYDOWN is followed by an
-    // SDL_TEXTINPUT event carrying the same character, even when Normal
-    // mode just consumed it as a command (e.g. 'i' entering Insert mode,
-    // or plain hjkl movement). Record whether *this* call claimed a key
-    // while starting out in Normal mode, so the caller can swallow that
-    // trailing SDL_TEXTINPUT instead of typing the command letter into
-    // the buffer. Must be captured before dispatch, since a command like
-    // 'i' changes vs->mode as part of handling the key.
     bool was_insert = (vs->mode == VIM_MODE_INSERT);
     bool handled = vim_dispatch_key(vs, e, key);
     if (!was_insert && handled) {
