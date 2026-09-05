@@ -78,6 +78,7 @@ static void editor_add_op(Editor *e, Edit_Kind kind, size_t pos, const char *tex
     }
     e->group_open = true;
     e->group_time = now;
+    e->dirty = true;
 
     Edit_Op op = {
         .kind = kind,
@@ -157,6 +158,14 @@ void editor_undo(Editor *e)
         editor_apply_undo(e, &group.items[i - 1]);
     }
 
+    // Bypasses editor_add_op (it's replaying recorded ops, not creating
+    // new ones), so it must set this itself: undoing back to an earlier
+    // state still leaves the buffer different from what's on disk unless
+    // that earlier state happens to be the last-saved one, which isn't
+    // worth tracking separately - better to over-warn on save/quit than
+    // silently let a discard slip through.
+    e->dirty = true;
+
     editor_retokenize(e);
     e->last_stroke = SDL_GetTicks();
 }
@@ -175,6 +184,7 @@ void editor_redo(Editor *e)
     for (size_t i = 0; i < group.count; ++i) {
         editor_apply_redo(e, &group.items[i]);
     }
+    e->dirty = true; // see editor_undo's comment on the same line
 
     editor_retokenize(e);
     e->last_stroke = SDL_GetTicks();
@@ -263,6 +273,7 @@ Errno editor_save_as(Editor *e, const char *file_path)
     e->file_path.count = 0;
     sb_append_cstr(&e->file_path, file_path);
     sb_append_null(&e->file_path);
+    e->dirty = false;
     return 0;
 }
 
@@ -290,8 +301,26 @@ Errno editor_load_from_file(Editor *e, const char *file_path)
     e->file_path.count = 0;
     sb_append_cstr(&e->file_path, file_path);
     sb_append_null(&e->file_path);
+    e->dirty = false;
 
     return 0;
+}
+
+// Resets the editor to a blank, unsaved buffer with no file backing it
+// yet (Ctrl+N). Mirrors editor_load_from_file's reset of history/cursor/
+// selection/search, minus the actual file read.
+void editor_new_file(Editor *e)
+{
+    editor_free_history(e);
+    editor_stop_search(e);
+
+    e->data.count = 0;
+    e->cursor = 0;
+    e->selection = false;
+    e->file_path.count = 0;
+    e->dirty = false;
+
+    editor_retokenize(e);
 }
 
 size_t editor_row_at(const Editor *e, size_t pos)

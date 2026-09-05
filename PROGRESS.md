@@ -61,6 +61,15 @@ Stack: SDL2 + OpenGL 3.3 + GLEW + FreeType, using hand-rolled data structures (d
 - **Normal-mode cursor was a thicker bar, not a block.** `cursor_block` only changed a hardcoded width (5px → 12px); it never actually filled the glyph cell. Fixed by sizing the block to the real glyph advance (`atlas->metrics[ch].ax`) of the character under the cursor, falling back to the space glyph's width past end-of-buffer/line or on control characters.
 - Incidental bug caught by the second fix's review: `vim_handle_key` was running unconditionally even while `e->searching` — meaning typing an incremental-search query while in Normal mode (the default mode) got intercepted as Vim commands instead of reaching the search box. Fixed by having Vim defer entirely to the editor's search handling while `e->searching` is true.
 
+### 2.6 Unsaved-changes prompt, save-as, and new-file
+`src/editor.c`, `src/editor.h`, `src/main.c`
+
+- `Editor` grew a `dirty` flag, set in the one place every content mutation already funnels through (`editor_add_op`) plus `editor_undo`/`editor_redo` (which bypass that funnel by replaying recorded ops directly). Cleared on a successful save/save-as/load/new-file.
+- `main.c` replaced its `file_browser` bool with an `App_Mode` enum (`APP_MODE_EDITOR` / `_FILE_BROWSER` / `_SAVE_AS` / `_CONFIRM`) — mutually exclusive by construction, unlike stacking more bools would have been.
+- **F3** (open file browser), **Ctrl+N** (new file), and closing the window / **Ctrl+Q** (quit) all go through `request_action()`: if `editor.dirty`, it parks the request behind an `APP_MODE_CONFIRM` y/n prompt instead of running it immediately. Only explicit `y` confirms — Enter is deliberately *not* an alias for it, so an accidental Enter while the prompt is up (easy to hit out of habit) falls back to the safe (cancel) option like `n`/Escape, not the destructive one.
+- **F2** now prompts for a path (`APP_MODE_SAVE_AS`) instead of erroring when the buffer has none yet; **Ctrl+Shift+S** always opens that prompt (pre-filled with the current path, if any) as an explicit "Save As".
+- **`draw_bottom_bar`**: the renderer has no screen-space drawing mode of its own — every vertex goes through the same camera transform as the document text (`shaders/simple.vert`) — so this computes where "the bottom of the visible viewport" currently sits in that world space (from `sr->camera_pos`/`camera_scale`/`resolution`, right after `editor_render()` updates them for the frame) and draws a bar there. Used for the confirm prompt, the save-as path entry, and now also `flash_error` messages, which used to go to stderr only.
+
 ## 3. Notes / known quirks
 
 - Undo/redo place the caret at the start (undo) or end (redo) of the change; exact caret restoration is not implemented.
@@ -70,16 +79,15 @@ Stack: SDL2 + OpenGL 3.3 + GLEW + FreeType, using hand-rolled data structures (d
 
 ## 4. What is left (roadmap, in rough priority order)
 
-1. **Unsaved-changes prompt** — warn before opening another file (via F3) or quitting when the buffer is dirty. Prevents data loss.
-2. **Save-as / new-file dialog** — running `ded` without a file can't save (`F2` currently errors). Needs a small path-entry UI and a "new buffer" command.
-3. **Line numbers + status bar** — line:col, filename, dirty indicator, adjustable horizontal scroll.
-4. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
-5. **File-browser search** — type to filter the file list (TODO in `src/main.c`).
-6. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
-7. **Editing polish** — delete word, delete line, delete selection via cut-like key, replace.
-8. **Multiple buffers / tabs**, split view, project-wide search, git integration.
-9. **Mouse support** — click to place cursor, wheel scroll, drag to select.
-10. **Config** — theme, font choice (currently hardcoded Iosevka), tab width, keybindings.
+1. ~~**Unsaved-changes prompt**~~ / ~~**Save-as / new-file dialog**~~ — done, see §2.6.
+2. **Line numbers + status bar** — line:col, filename, dirty indicator (a permanent one — §2.6's bottom bar only appears for prompts/errors, not standing status), adjustable horizontal scroll.
+3. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
+4. **File-browser search** — type to filter the file list (TODO in `src/main.c`).
+5. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
+6. **Editing polish** — delete word, replace.
+7. **Multiple buffers / tabs**, split view, project-wide search, git integration.
+8. **Mouse support** — click to place cursor, wheel scroll, drag to select.
+9. **Config** — theme, font choice (currently hardcoded Iosevka), tab width, keybindings.
 
 ### 4.1 Vim modal editing — what's left (see `src/vim.h`'s header comment for the authoritative scope notes)
 
@@ -98,10 +106,6 @@ Stack: SDL2 + OpenGL 3.3 + GLEW + FreeType, using hand-rolled data structures (d
 
 From `src/main.c` and elsewhere:
 
-- Save dialog when `ded` is run without a file (`F2`).
-- Ability to create a new file.
-- Ask the user about unsaved changes before opening another file.
-- Error messages (`flash_error`) go to stderr only, not into the editor window.
 - Font path is hardcoded; no user customization.
 - Search does not auto-fill from the current selection.
 - File browser has no incremental search.

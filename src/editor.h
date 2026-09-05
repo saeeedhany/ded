@@ -79,11 +79,24 @@ typedef struct {
     // true -> draw a full-width block cursor (Normal mode convention),
     // false -> draw the thin insertion bar (current/Insert behavior).
     bool cursor_block;
+
+    // True from the moment the buffer diverges from what's on disk (or
+    // from a blank new buffer) until the next successful save. Set in
+    // one place - editor_add_op, the funnel every content mutation
+    // (insert/delete/indent/dedent) already goes through - plus
+    // editor_undo/editor_redo, which bypass that funnel by design (they
+    // replay recorded ops directly) but still change the buffer. Cleared
+    // by editor_save/editor_save_as on success, editor_load_from_file,
+    // and editor_new_file. The caller (main.c) is expected to check this
+    // before destructive actions (opening another file, quitting) and
+    // confirm with the user first.
+    bool dirty;
 } Editor;
 
 Errno editor_save_as(Editor *editor, const char *file_path);
 Errno editor_save(const Editor *editor);
 Errno editor_load_from_file(Editor *editor, const char *file_path);
+void editor_new_file(Editor *editor);
 
 void editor_backspace(Editor *editor);
 void editor_delete(Editor *editor);

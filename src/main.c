@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <string.h>
 
@@ -23,13 +24,7 @@
 #include "./sv.h"
 #include "./vim.h"
 
-// TODO: Save file dialog
-// Needed when ded is ran without any file so it does not know where to save.
-
-// TODO: An ability to create a new file
 // TODO: Delete a word
-// TODO: Delete selection
-// TODO: Undo/redo system
 
 void MessageCallback(GLenum source,
                      GLenum type,
@@ -54,8 +49,129 @@ static Editor editor = {0};
 static File_Browser fb = {0};
 static Vim_State vim = {0};
 
-// TODO: display errors reported via flash_error right in the text editor window somehow
-#define flash_error(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+// Which full-screen view is active. Mutually exclusive by construction
+// (unlike the plain bools this replaced) - exactly one of these is ever
+// "current" at a time, so there's no way to e.g. have both the file
+// browser and a save-as prompt think they own the keyboard at once.
+typedef enum {
+    APP_MODE_EDITOR,
+    APP_MODE_FILE_BROWSER,
+    APP_MODE_SAVE_AS, // typing a destination path for F2/Ctrl+Shift+S
+    APP_MODE_CONFIRM, // "you have unsaved changes, proceed anyway? (y/n)"
+} App_Mode;
+
+// What to do once APP_MODE_CONFIRM's y/n is answered. Set by
+// request_action() alongside the mode switch, read back by
+// perform_action() when the user confirms.
+typedef enum {
+    CONFIRM_ACTION_OPEN_BROWSER, // F3
+    CONFIRM_ACTION_NEW_FILE,     // Ctrl+N
+    CONFIRM_ACTION_QUIT,         // Ctrl+Q / closing the window
+} Confirm_Action;
+
+static App_Mode mode = APP_MODE_EDITOR;
+static Confirm_Action pending_action = CONFIRM_ACTION_QUIT;
+static bool quit = false;
+
+#define SAVE_AS_PATH_CAP 1024
+static char save_as_path[SAVE_AS_PATH_CAP] = {0};
+static size_t save_as_path_len = 0;
+
+#define ERROR_DISPLAY_MS 4000
+static char error_message[256] = {0};
+static Uint32 error_message_time = 0;
+
+// Errors used to go to stderr only, invisible once the app has its own
+// window - now they're also kept around to flash in a bottom bar for a
+// few seconds the next time the editor view renders (see draw_bottom_bar
+// and its call site).
+static void flash_error(const char *fmt, ...)
+{
+    va_list args;
+
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+
+    va_start(args, fmt);
+    vsnprintf(error_message, sizeof(error_message), fmt, args);
+    va_end(args);
+    error_message_time = SDL_GetTicks();
+}
+
+// Actually carries out a Confirm_Action, either because there was
+// nothing to lose (request_action skipped the prompt) or because the
+// user just answered 'y' to it.
+static void perform_action(Confirm_Action action)
+{
+    editor_flush_group(&editor);
+    switch (action) {
+    case CONFIRM_ACTION_OPEN_BROWSER:
+        mode = APP_MODE_FILE_BROWSER;
+        break;
+    case CONFIRM_ACTION_NEW_FILE:
+        editor_new_file(&editor);
+        mode = APP_MODE_EDITOR;
+        break;
+    case CONFIRM_ACTION_QUIT:
+        quit = true;
+        break;
+    }
+}
+
+// Entry point for anything that would discard unsaved work (opening the
+// file browser, starting a new file, quitting): runs immediately if the
+// buffer isn't dirty, otherwise parks the request behind an APP_MODE_CONFIRM
+// y/n prompt instead.
+static void request_action(Confirm_Action action)
+{
+    if (editor.dirty) {
+        pending_action = action;
+        mode = APP_MODE_CONFIRM;
+    } else {
+        perform_action(action);
+    }
+}
+
+static const char *confirm_message(Confirm_Action action)
+{
+    switch (action) {
+    case CONFIRM_ACTION_OPEN_BROWSER:
+        return "Unsaved changes! Discard and open the file browser? (y/n)";
+    case CONFIRM_ACTION_NEW_FILE:
+        return "Unsaved changes! Discard and start a new file? (y/n)";
+    case CONFIRM_ACTION_QUIT:
+        return "Unsaved changes! Quit without saving? (y/n)";
+    }
+    UNREACHABLE("confirm_message");
+}
+
+// Draws a single-line bar pinned to the bottom edge of the current
+// camera view. The renderer has no screen-space drawing mode of its own
+// - every vertex, including this one, goes through the same
+// camera_pos/camera_scale transform as the document text (see
+// shaders/simple.vert) - so this computes where "the bottom of the
+// visible viewport" currently sits in that same world space and draws
+// there instead. Must be called right after editor_render() so sr's
+// camera_pos/camera_scale/resolution reflect this frame, not a stale one.
+static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const char *text, Vec4f bg, Vec4f fg)
+{
+    float half_w = sr->resolution.x / (2.0f * sr->camera_scale);
+    float half_h = sr->resolution.y / (2.0f * sr->camera_scale);
+    float bar_h = FREE_GLYPH_FONT_SIZE * 1.4f;
+    Vec2f bar_pos = vec2f(sr->camera_pos.x - half_w, sr->camera_pos.y - half_h);
+    Vec2f bar_size = vec2f(2.0f * half_w, bar_h);
+
+    simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
+    simple_renderer_solid_rect(sr, bar_pos, bar_size, bg);
+    simple_renderer_flush(sr);
+
+    simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+    Vec2f text_pos = vec2f(bar_pos.x + 10.0f, bar_pos.y + bar_h * 0.3f);
+    free_glyph_atlas_render_line_sized(atlas, sr, text, strlen(text), &text_pos, fg);
+    simple_renderer_flush(sr);
+}
 
 
 int main(int argc, char **argv)
@@ -164,23 +280,22 @@ int main(int argc, char **argv)
     vim = vim_state_init();
     editor.cursor_block = (vim.mode == VIM_MODE_NORMAL);
 
-    bool quit = false;
-    bool file_browser = false;
     while (!quit) {
         const Uint32 start = SDL_GetTicks();
         SDL_Event event = {0};
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
             case SDL_QUIT: {
-                quit = true;
+                request_action(CONFIRM_ACTION_QUIT);
             }
             break;
 
             case SDL_KEYDOWN: {
-                if (file_browser) {
+                switch (mode) {
+                case APP_MODE_FILE_BROWSER: {
                     switch (event.key.keysym.sym) {
                     case SDLK_F3: {
-                        file_browser = false;
+                        mode = APP_MODE_EDITOR;
                     }
                     break;
 
@@ -212,13 +327,18 @@ int main(int argc, char **argv)
                                 break;
 
                                 case FT_REGULAR: {
-                                    // TODO: before opening a new file make sure you don't have unsaved changes
-                                    // And if you do, annoy the user about it. (just like all the other editors do)
+                                    // Unsaved-changes confirmation already
+                                    // happened before we could even get into
+                                    // the file browser (see F3's
+                                    // request_action call below) - nothing
+                                    // edits the buffer while this mode is
+                                    // active, so there's nothing new to lose
+                                    // by loading over it here.
                                     err = editor_load_from_file(&editor, file_path);
                                     if (err != 0) {
                                         flash_error("Could not open file %s: %s", file_path, strerror(err));
                                     } else {
-                                        file_browser = false;
+                                        mode = APP_MODE_EDITOR;
                                     }
                                 }
                                 break;
@@ -236,7 +356,66 @@ int main(int argc, char **argv)
                     }
                     break;
                     }
-                } else {
+                } break;
+
+                case APP_MODE_CONFIRM: {
+                    switch (event.key.keysym.sym) {
+                    case SDLK_y:
+                        perform_action(pending_action);
+                        break;
+
+                    // Only explicit 'y' confirms discarding work. Enter is
+                    // deliberately NOT an alias for it - this prompt exists
+                    // specifically to catch a moment where Enter is easy to
+                    // hit out of habit (mid-edit, or closing the window),
+                    // so it has to fall back to the safe (cancel) option
+                    // like 'n'/Escape do, not the destructive one.
+                    case SDLK_n:
+                    case SDLK_RETURN:
+                    case SDLK_ESCAPE:
+                        mode = APP_MODE_EDITOR;
+                        break;
+
+                    default:
+                        break;
+                    }
+                } break;
+
+                case APP_MODE_SAVE_AS: {
+                    switch (event.key.keysym.sym) {
+                    case SDLK_RETURN: {
+                        if (save_as_path_len > 0) {
+                            editor_flush_group(&editor);
+                            err = editor_save_as(&editor, save_as_path);
+                            if (err != 0) {
+                                flash_error("Could not save as %s: %s", save_as_path, strerror(err));
+                                // stay in the prompt so the path can be fixed
+                            } else {
+                                mode = APP_MODE_EDITOR;
+                            }
+                        }
+                    }
+                    break;
+
+                    case SDLK_ESCAPE: {
+                        mode = APP_MODE_EDITOR;
+                    }
+                    break;
+
+                    case SDLK_BACKSPACE: {
+                        if (save_as_path_len > 0) {
+                            save_as_path_len -= 1;
+                            save_as_path[save_as_path_len] = '\0';
+                        }
+                    }
+                    break;
+
+                    default:
+                        break;
+                    }
+                } break;
+
+                case APP_MODE_EDITOR: {
                     if (vim_handle_key(&vim, &editor, event.key.keysym)) {
                         editor.last_stroke = SDL_GetTicks();
                     } else {
@@ -275,17 +454,48 @@ int main(int argc, char **argv)
                             err = editor_save(&editor);
                             if (err != 0) {
                                 flash_error("Could not save currently edited file: %s", strerror(err));
+                            } else {
+                                editor.dirty = false;
                             }
                         } else {
-                            // TODO: ask the user for the path to save to in this situation
-                            flash_error("Nowhere to save the text");
+                            editor_flush_group(&editor);
+                            save_as_path[0] = '\0';
+                            save_as_path_len = 0;
+                            mode = APP_MODE_SAVE_AS;
                         }
                     }
                     break;
 
                     case SDLK_F3: {
-                        editor_flush_group(&editor);
-                        file_browser = true;
+                        request_action(CONFIRM_ACTION_OPEN_BROWSER);
+                    }
+                    break;
+
+                    case SDLK_n: {
+                        if (event.key.keysym.mod & KMOD_CTRL) {
+                            request_action(CONFIRM_ACTION_NEW_FILE);
+                        }
+                    }
+                    break;
+
+                    case SDLK_q: {
+                        if (event.key.keysym.mod & KMOD_CTRL) {
+                            request_action(CONFIRM_ACTION_QUIT);
+                        }
+                    }
+                    break;
+
+                    case SDLK_s: {
+                        if ((event.key.keysym.mod & KMOD_CTRL) && (event.key.keysym.mod & KMOD_SHIFT)) {
+                            editor_flush_group(&editor);
+                            save_as_path[0] = '\0';
+                            save_as_path_len = 0;
+                            if (editor.file_path.count > 0) {
+                                snprintf(save_as_path, SAVE_AS_PATH_CAP, "%s", editor.file_path.items);
+                                save_as_path_len = strlen(save_as_path);
+                            }
+                            mode = APP_MODE_SAVE_AS;
+                        }
                     }
                     break;
 
@@ -440,34 +650,55 @@ int main(int argc, char **argv)
                     break;
                     }
                     }
+                } break;
                 }
             }
             break;
 
             case SDL_TEXTINPUT: {
-                if (file_browser) {
+                switch (mode) {
+                case APP_MODE_FILE_BROWSER:
                     // Nothing for now
                     // Once we have incremental search in the file browser this may become useful
-                } else if (vim_take_consumed_textinput(&vim)) {
-                    // vim_handle_key just claimed the SDL_KEYDOWN this
-                    // SDL_TEXTINPUT belongs to (even if that command, like
-                    // 'i', switched us to Insert mode) - swallow it so the
-                    // command letter doesn't also get typed into the buffer.
-                } else if (!editor.searching && vim.mode == VIM_MODE_NORMAL) {
-                    // Normal mode: letters not (yet) bound to a command are
-                    // still not text - swallow them too rather than typing
-                    // them. Not while searching, though: vim_handle_key steps
-                    // aside entirely then (see vim.c), so this event is the
-                    // search query being typed and must reach editor_insert_buf
-                    // below, which routes it into e->search instead of the
-                    // document.
-                } else {
+                    break;
+
+                case APP_MODE_CONFIRM:
+                    // y/n is handled entirely in SDL_KEYDOWN above.
+                    break;
+
+                case APP_MODE_SAVE_AS: {
                     const char *text = event.text.text;
                     size_t text_len = strlen(text);
-                    for (size_t i = 0; i < text_len; ++i) {
-                        editor_insert_char(&editor, text[i]);
+                    for (size_t i = 0; i < text_len && save_as_path_len + 1 < SAVE_AS_PATH_CAP; ++i) {
+                        save_as_path[save_as_path_len++] = text[i];
                     }
-                    editor.last_stroke = SDL_GetTicks();
+                    save_as_path[save_as_path_len] = '\0';
+                }
+                break;
+
+                case APP_MODE_EDITOR:
+                    if (vim_take_consumed_textinput(&vim)) {
+                        // vim_handle_key just claimed the SDL_KEYDOWN this
+                        // SDL_TEXTINPUT belongs to (even if that command, like
+                        // 'i', switched us to Insert mode) - swallow it so the
+                        // command letter doesn't also get typed into the buffer.
+                    } else if (!editor.searching && vim.mode == VIM_MODE_NORMAL) {
+                        // Normal mode: letters not (yet) bound to a command are
+                        // still not text - swallow them too rather than typing
+                        // them. Not while searching, though: vim_handle_key steps
+                        // aside entirely then (see vim.c), so this event is the
+                        // search query being typed and must reach editor_insert_buf
+                        // below, which routes it into e->search instead of the
+                        // document.
+                    } else {
+                        const char *text = event.text.text;
+                        size_t text_len = strlen(text);
+                        for (size_t i = 0; i < text_len; ++i) {
+                            editor_insert_char(&editor, text[i]);
+                        }
+                        editor.last_stroke = SDL_GetTicks();
+                    }
+                    break;
                 }
             }
             break;
@@ -485,10 +716,21 @@ int main(int argc, char **argv)
         glClearColor(bg.x, bg.y, bg.z, bg.w);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        if (file_browser) {
+        if (mode == APP_MODE_FILE_BROWSER) {
             fb_render(&fb, window, &atlas, &sr);
         } else {
             editor_render(window, &atlas, &sr, &editor);
+
+            Vec4f bar_fg = vec4fs(1.0f);
+            if (mode == APP_MODE_CONFIRM) {
+                draw_bottom_bar(&sr, &atlas, confirm_message(pending_action), hex_to_vec4f(0x4A1D1DFF), bar_fg);
+            } else if (mode == APP_MODE_SAVE_AS) {
+                char prompt[SAVE_AS_PATH_CAP + 32];
+                snprintf(prompt, sizeof(prompt), "Save as: %s_", save_as_path);
+                draw_bottom_bar(&sr, &atlas, prompt, hex_to_vec4f(0x1D2E4AFF), bar_fg);
+            } else if (error_message[0] != '\0' && SDL_GetTicks() - error_message_time < ERROR_DISPLAY_MS) {
+                draw_bottom_bar(&sr, &atlas, error_message, hex_to_vec4f(0x4A1D1DFF), bar_fg);
+            }
         }
 
         SDL_GL_SwapWindow(window);
