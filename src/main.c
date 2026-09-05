@@ -73,6 +73,17 @@ static App_Mode mode = APP_MODE_EDITOR;
 static Confirm_Action pending_action = CONFIRM_ACTION_QUIT;
 static bool quit = false;
 
+// True for exactly one SDL_TEXTINPUT: the one immediately following a
+// SDL_KEYDOWN that changed `mode` (e.g. 'y' confirming a prompt, which
+// jumps straight back to APP_MODE_EDITOR). SDL fires that trailing
+// SDL_TEXTINPUT no matter what - it belongs to whatever mode the
+// keydown was handled in, not the new mode we just switched into, so it
+// must never be typed as document text (or a save-as path, etc.)
+// regardless of which mode's own SDL_TEXTINPUT rules would otherwise
+// apply. This is what let a confirm keypress like 'y' leak into a
+// freshly-created buffer when Vim was still in Insert mode underneath.
+static bool app_mode_changed_this_key = false;
+
 #define SAVE_AS_PATH_CAP 1024
 static char save_as_path[SAVE_AS_PATH_CAP] = {0};
 static size_t save_as_path_len = 0;
@@ -147,20 +158,38 @@ static const char *confirm_message(Confirm_Action action)
     UNREACHABLE("confirm_message");
 }
 
-// Draws a single-line bar pinned to the bottom edge of the current
-// camera view. The renderer has no screen-space drawing mode of its own
-// - every vertex, including this one, goes through the same
-// camera_pos/camera_scale transform as the document text (see
-// shaders/simple.vert) - so this computes where "the bottom of the
-// visible viewport" currently sits in that same world space and draws
-// there instead. Must be called right after editor_render() so sr's
-// camera_pos/camera_scale/resolution reflect this frame, not a stale one.
+// Fixed zoom for screen-space UI overlays (the bottom bar), chosen
+// independently of the document's own camera. FREE_GLYPH_FONT_SIZE (64)
+// times this is the glyphs' actual on-screen pixel height.
+#define UI_TEXT_SCALE 0.3125f
+#define UI_BAR_HEIGHT_PX 36.0f
+#define UI_TEXT_PADDING_PX 12.0f
+
+// Draws a single-line bar pinned to the bottom edge of the window,
+// always occupying exactly UI_BAR_HEIGHT_PX screen pixels regardless of
+// window size OR the document's own pan/zoom. The renderer has no
+// screen-space drawing mode of its own - every vertex, including this
+// one, goes through the same camera_pos/camera_scale transform as the
+// document text (see shaders/simple.vert) - so riding the document's
+// live camera (as an earlier version of this function did) made the bar
+// zoom with the document too, which could blow it up well past the
+// window's edges whenever the document's own auto-zoom went extreme
+// (e.g. an empty buffer zooms in a lot, since the target scale divides
+// by the longest visible line's length). Fixed by using a *different*,
+// fixed camera transform just for this draw call - saved and restored
+// so the next document draw call this frame isn't affected.
 static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const char *text, Vec4f bg, Vec4f fg)
 {
-    float half_w = sr->resolution.x / (2.0f * sr->camera_scale);
-    float half_h = sr->resolution.y / (2.0f * sr->camera_scale);
-    float bar_h = FREE_GLYPH_FONT_SIZE * 1.4f;
-    Vec2f bar_pos = vec2f(sr->camera_pos.x - half_w, sr->camera_pos.y - half_h);
+    Vec2f saved_camera_pos = sr->camera_pos;
+    float saved_camera_scale = sr->camera_scale;
+
+    sr->camera_scale = UI_TEXT_SCALE;
+    float half_w = sr->resolution.x / (2.0f * UI_TEXT_SCALE);
+    float half_h = sr->resolution.y / (2.0f * UI_TEXT_SCALE);
+    sr->camera_pos = vec2f(half_w, half_h); // (0,0) now maps to the window's bottom-left corner
+
+    float bar_h = UI_BAR_HEIGHT_PX / UI_TEXT_SCALE;
+    Vec2f bar_pos = vec2f(0.0f, 0.0f);
     Vec2f bar_size = vec2f(2.0f * half_w, bar_h);
 
     simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
@@ -168,9 +197,12 @@ static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const 
     simple_renderer_flush(sr);
 
     simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
-    Vec2f text_pos = vec2f(bar_pos.x + 10.0f, bar_pos.y + bar_h * 0.3f);
+    Vec2f text_pos = vec2f(UI_TEXT_PADDING_PX / UI_TEXT_SCALE, bar_h * 0.28f);
     free_glyph_atlas_render_line_sized(atlas, sr, text, strlen(text), &text_pos, fg);
     simple_renderer_flush(sr);
+
+    sr->camera_pos = saved_camera_pos;
+    sr->camera_scale = saved_camera_scale;
 }
 
 
@@ -291,6 +323,7 @@ int main(int argc, char **argv)
             break;
 
             case SDL_KEYDOWN: {
+                App_Mode mode_before_key = mode;
                 switch (mode) {
                 case APP_MODE_FILE_BROWSER: {
                     switch (event.key.keysym.sym) {
@@ -652,10 +685,18 @@ int main(int argc, char **argv)
                     }
                 } break;
                 }
+                app_mode_changed_this_key = (mode != mode_before_key);
             }
             break;
 
             case SDL_TEXTINPUT: {
+                if (app_mode_changed_this_key) {
+                    app_mode_changed_this_key = false;
+                    // See the flag's own comment: this key just switched
+                    // which app-level mode we're in, so its trailing text
+                    // event belongs to the mode we left and must be
+                    // swallowed no matter which mode we're now in.
+                } else
                 switch (mode) {
                 case APP_MODE_FILE_BROWSER:
                     // Nothing for now
