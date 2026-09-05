@@ -98,6 +98,17 @@ Architectural groundwork, not a user-facing feature by itself: `main.c`'s ~240-l
 - **Visual mode**: `v`/`V` (charwise/linewise) reuse the editor's existing selection mechanism directly — entering Visual just anchors `select_begin` at the cursor, and every motion moves `e->cursor` as normal, so the selection grows for free. `d`/`x`/`c`/`y` act on the current selection (Visual's charwise selection is inclusive of both ends, unlike a motion's usual exclusive end); `v`/`V` toggle mode or exit; Escape exits without changing the buffer. Arrow-key movement in Visual mode needed one change in `main.c`: `shift_extends_selection` commands now also extend when `vim.mode == VIM_MODE_VISUAL`, not just on an actual Shift press, so plain arrows don't clear the selection while in Visual mode.
 - Not done: counts don't apply to Visual-mode operators, entering Visual with a count, or `i`-with-count (real Vim repeats the insertion); text objects; `dj`/`dgg`/`dG` still unsupported (same pre-existing limit as before, see `vim.h`).
 
+### 2.10 Modular restructure + Vim as a runtime toggle
+`src/main.c`, `src/app.c`/`.h` (new), `src/vim.c`/`.h`, `src/config.c`/`.h`, `src/editor.h`, `src/tes_motion.c`, `src/tes_command.c`
+
+`main.c` had grown to ~950 lines mixing GL/SDL/FreeType bootstrap, the App_Mode event loop, and ~30 command implementations. Split along that seam:
+
+- **`main.c`** (~110 lines now): FreeType/SDL/GL/window setup, then hands off to `app_run()`.
+- **`app.c`/`app.h`** (new): everything else that was in `main.c` — `App_Mode`, `Confirm_Action`, the `editor`/`fb`/`vim` state, all `cmd_*` commands + the default-commands/keybindings tables, the bottom bar, and the event loop itself, behind one entry point (`app_run`).
+- **Vim is now a genuine runtime toggle**, not just always-on: `Config.vim_mode` (default `true`) drives a `vim_enabled` flag in `app.c`. When false, `vim_handle_key`/`vim_handle_browser_key` are never called at all - Vim is fully inert, not "returning false a lot" - so a bug in `vim.c` can't affect classic editing or browsing while it's off. New unbound-by-default command `toggle-vim-mode` flips it live (`bind <chord> = toggle-vim-mode` to use it).
+- **Vim now reaches the file browser**: `vim_handle_browser_key(Vim_State*, File_Browser*, SDL_Keysym)` in `vim.c` adds `j`/`k` (with counts), `gg`/`G` for the flat file list, tried before the existing Up/Down/Enter/F3 handling (unchanged, still the fallback with Vim off or on an unclaimed key).
+- **`Editor`/`Config`** gained `line_numbers`/`relative_line_numbers` (parsed, stored, not yet rendered - the gutter itself is a follow-up).
+
 ## 3. Notes / known quirks
 
 - Undo/redo place the caret at the start (undo) or end (redo) of the change; exact caret restoration is not implemented.
@@ -108,16 +119,17 @@ Architectural groundwork, not a user-facing feature by itself: `main.c`'s ~240-l
 ## 4. What is left (roadmap, in rough priority order)
 
 1. ~~**Unsaved-changes prompt**~~ / ~~**Save-as / new-file dialog**~~ — done, see §2.6.
-2. ~~**Config**~~ — font path, tab width, and keybinding overrides done, see §2.8. Theme/color config is the missing piece (below).
-3. **Line numbers + status bar** — line:col, filename, dirty indicator (a permanent one — §2.6's bottom bar only appears for prompts/errors, not standing status), adjustable horizontal scroll.
-4. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
-5. **File-browser search** — type to filter the file list (TODO in `src/main.c`).
-6. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
-7. **Editing polish** — delete word, replace.
-8. **Multiple buffers / tabs**, split view, project-wide search, git integration.
-9. **Mouse support** — click to place cursor, wheel scroll, drag to select.
-10. **Theme/color config** — background, selection, syntax-highlight, and UI-bar colors are still hardcoded hex literals in `editor.c`/`main.c`; a natural next slice of §2.8's config file.
-11. **Plugin/scripting layer** — deliberately not started (see §2.8's intro): `command_register`/`keymap_bind` are the seam it would attach to (a script registers its own commands and binds keys to them, the same way `main.c`'s own defaults do), but there's no embedded language yet. Lua is the natural choice if/when this is worth doing (small, fast, trivial to vendor, and the proven model for exactly this kind of editor).
+2. ~~**Config**~~ — font path, tab width, keybinding overrides, and Vim on/off all done, see §2.8/§2.10. Theme/color config and the line-number gutter are the missing pieces (below).
+3. **Line-number gutter rendering** — `Config`/`Editor` already have `line_numbers`/`relative_line_numbers` (§2.10); the actual gutter drawing in `editor_render` (plus its effect on cursor/camera math) is the remaining piece.
+4. **Status bar** — line:col, filename, dirty indicator (a permanent one — §2.6's bottom bar only appears for prompts/errors, not standing status), adjustable horizontal scroll.
+5. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
+6. **File-browser search** — type to filter the file list (TODO in `src/main.c`).
+7. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
+8. **Editing polish** — delete word, replace.
+9. **Multiple buffers / tabs**, split view, project-wide search, git integration.
+10. **Mouse support** — click to place cursor, wheel scroll, drag to select.
+11. **Theme/color config** — background, selection, syntax-highlight, and UI-bar colors are still hardcoded hex literals in `editor.c`/`app.c`; a natural next slice of the config file.
+12. **Plugin/scripting layer** — deliberately not started: `command_register`/`keymap_bind` (§2.8) are the seam it would attach to (a script registers its own commands and binds keys to them, the same way `app.c`'s own defaults do), and §2.10's `vim_enabled` pattern is the model for making a scripting layer itself optional/toggleable too - but there's no embedded language yet. Lua is the natural choice if/when this is worth doing (small, fast, trivial to vendor, and the proven model for exactly this kind of editor).
 
 ### 4.1 Vim modal editing — what's left (see `src/vim.h`'s header comment for the authoritative scope notes)
 

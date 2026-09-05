@@ -1,6 +1,7 @@
 #ifndef CONFIG_H_
 #define CONFIG_H_
 
+#include <stdbool.h>
 #include "./common.h"
 
 #define CONFIG_FONT_PATH_CAP 512
@@ -8,13 +9,14 @@
 typedef struct {
     char font_path[CONFIG_FONT_PATH_CAP];
     size_t tab_width;
+    bool vim_mode;              // Vim keybindings on/off, everywhere (editor + file browser)
+    bool line_numbers;          // stored for now; rendering is a follow-up
+    bool relative_line_numbers; // stored for now; rendering is a follow-up
 } Config;
 
 // Built-in defaults - what the editor uses with no config file, or for
-// any setting a config file doesn't mention. Not the same as `Config{0}`:
-// a zeroed Config has an empty font_path and tab_width 0, neither of
-// which is a usable value (see Editor::indent_width's own comment on
-// the tab_width==0 case).
+// any setting a config file doesn't mention. Not the same as `Config{0}`
+// (empty font_path, tab_width 0 - see Editor::indent_width's comment).
 Config config_default(void);
 
 // Loads `path` on top of `*cfg` (already holding at least

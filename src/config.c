@@ -12,6 +12,9 @@ Config config_default(void)
     Config cfg = {0};
     snprintf(cfg.font_path, sizeof(cfg.font_path), "%s", "./fonts/iosevka-regular.ttf");
     cfg.tab_width = 4;
+    cfg.vim_mode = true;
+    cfg.line_numbers = false;
+    cfg.relative_line_numbers = false;
     return cfg;
 }
 
@@ -26,6 +29,13 @@ static bool sv_to_cstr(String_View sv, char *out, size_t out_cap)
     memcpy(out, sv.data, sv.count);
     out[sv.count] = '\0';
     return true;
+}
+
+static bool sv_to_bool(String_View sv, bool *out)
+{
+    if (sv_eq_ignorecase(sv, SV("true"))) { *out = true; return true; }
+    if (sv_eq_ignorecase(sv, SV("false"))) { *out = false; return true; }
+    return false;
 }
 
 static void config_apply_line(String_View line, size_t line_no, Config *cfg)
@@ -65,6 +75,18 @@ static void config_apply_line(String_View line, size_t line_no, Config *cfg)
             fprintf(stderr, "config:%zu: tab_width must be between 1 and %d, ignoring\n", line_no, EDITOR_MAX_INDENT_WIDTH);
         } else {
             cfg->tab_width = width;
+        }
+    } else if (sv_eq_ignorecase(key, SV("vim_mode"))) {
+        if (!sv_to_bool(value, &cfg->vim_mode)) {
+            fprintf(stderr, "config:%zu: vim_mode must be true or false, ignoring\n", line_no);
+        }
+    } else if (sv_eq_ignorecase(key, SV("line_numbers"))) {
+        if (!sv_to_bool(value, &cfg->line_numbers)) {
+            fprintf(stderr, "config:%zu: line_numbers must be true or false, ignoring\n", line_no);
+        }
+    } else if (sv_eq_ignorecase(key, SV("relative_line_numbers"))) {
+        if (!sv_to_bool(value, &cfg->relative_line_numbers)) {
+            fprintf(stderr, "config:%zu: relative_line_numbers must be true or false, ignoring\n", line_no);
         }
     } else {
         fprintf(stderr, "config:%zu: unknown setting '"SV_Fmt"', ignoring\n", line_no, SV_Arg(key));

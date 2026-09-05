@@ -104,10 +104,14 @@ typedef struct {
     // state - editor_new_file/editor_load_from_file leave it alone.
     // Zero-initializing an Editor ({0}) leaves this 0, which makes Tab a
     // silent no-op rather than a crash - harmless, but not the intended
-    // default of 4, so main.c sets this explicitly at startup from
-    // Config right after zero-initializing `editor` (see config.h).
-    // Clamped to EDITOR_MAX_INDENT_WIDTH.
+    // default of 4, so app.c sets this explicitly at startup from
+    // Config (see config.h). Clamped to EDITOR_MAX_INDENT_WIDTH.
     size_t indent_width;
+
+    // User settings from Config, set once at startup. Not read by
+    // editor_render yet - the gutter itself is a follow-up.
+    bool line_numbers;
+    bool relative_line_numbers;
 } Editor;
 
 Errno editor_save_as(Editor *editor, const char *file_path);

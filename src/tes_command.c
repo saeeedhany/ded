@@ -85,6 +85,9 @@ int main(void)
     Config cfg = config_default();
     CHECK("config_default sets a non-empty font path", cfg.font_path[0] != '\0');
     CHECK("config_default sets tab_width to 4", cfg.tab_width == 4);
+    CHECK("config_default enables vim_mode", cfg.vim_mode);
+    CHECK("config_default disables line_numbers", !cfg.line_numbers);
+    CHECK("config_default disables relative_line_numbers", !cfg.relative_line_numbers);
 
     Errno err = config_load("/nonexistent/path/that/should/not/exist.conf", &cfg);
     CHECK("config_load on a missing file returns success (defaults stand)", err == 0);
@@ -98,6 +101,9 @@ int main(void)
         "\n"
         "font = ./fonts/VictorMono-Regular.ttf\n"
         "tab_width = 2\n"
+        "vim_mode = false\n"
+        "line_numbers = true\n"
+        "relative_line_numbers = TRUE\n"
         "bind ctrl+shift+q = test.a\n"
         "tab_width = 999\n"       // out of range - should warn and be ignored
         "not_a_real_setting = 1\n" // unknown key - should warn and be ignored
@@ -110,6 +116,9 @@ int main(void)
     CHECK("config_load applies font override", strcmp(file_cfg.font_path, "./fonts/VictorMono-Regular.ttf") == 0);
     CHECK("config_load applies tab_width override", file_cfg.tab_width == 2);
     CHECK("config_load ignores an out-of-range tab_width, keeping the last valid one", file_cfg.tab_width == 2);
+    CHECK("config_load applies vim_mode = false", !file_cfg.vim_mode);
+    CHECK("config_load applies line_numbers = true", file_cfg.line_numbers);
+    CHECK("config_load parses bool values case-insensitively", file_cfg.relative_line_numbers);
 
     resolved = keymap_resolve(KEY(SDLK_q, KMOD_LCTRL | KMOD_LSHIFT));
     CHECK("config_load's 'bind' line actually bound the chord", resolved == command_find("test.a"));

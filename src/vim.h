@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <SDL2/SDL.h>
 #include "./editor.h"
+#include "./file_browser.h"
 
 // Modal editing (Normal/Insert/Visual), operators (d/c/y) with counts,
 // and motions built on editor.c's pure editor_find_* functions.
@@ -52,5 +53,11 @@ bool vim_take_consumed_textinput(Vim_State *vs);
 // lets the caller's own mode-agnostic handling run (Ctrl+Z, F2, arrow
 // keys, Backspace, ...). Updates e->cursor_block for the current mode.
 bool vim_handle_key(Vim_State *vs, Editor *e, SDL_Keysym key);
+
+// Vim-style navigation for the file browser's flat file list: j/k (with
+// counts), gg/G for first/last. Reuses `vs` only for pending_g/count -
+// a file list has no Insert/Visual/operator concept. Returns true if
+// handled; caller's own arrow-key/Enter/F3 handling still runs otherwise.
+bool vim_handle_browser_key(Vim_State *vs, File_Browser *fb, SDL_Keysym key);
 
 #endif // VIM_H_

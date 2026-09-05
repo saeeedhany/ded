@@ -9,6 +9,7 @@
 #include "./editor.h"
 #include "./common.h"
 #include "./vim.h"
+#include "./file_browser.h"
 
 static int failures = 0;
 
@@ -489,6 +490,55 @@ int main(void)
     vim_handle_key(&ov, &o, KEY(SDLK_v));
     if (ov.mode != VIM_MODE_VISUAL || ov.visual_linewise) { printf("FAIL: 'v' after 'V' should switch to charwise, staying in Visual\n"); failures++; }
     else printf("ok:   'v' after 'V' switches Visual mode to charwise\n");
+
+    printf("\n--- vim file-browser navigation ---\n");
+
+    const char *browser_names[] = {"a.txt", "b.txt", "c.txt", "d.txt", "e.txt"};
+    File_Browser fbv = {0};
+    fbv.files.items = browser_names;
+    fbv.files.count = sizeof(browser_names) / sizeof(browser_names[0]);
+    fbv.cursor = 0;
+    Vim_State bv = vim_state_init();
+
+    bool browser_handled = vim_handle_browser_key(&bv, &fbv, KEY(SDLK_j));
+    CHECK_EQ("'j' moves the browser cursor down one", fbv.cursor, 1);
+    if (!browser_handled) { printf("FAIL: 'j' should be claimed by vim_handle_browser_key\n"); failures++; }
+    else printf("ok:   'j' is claimed by vim_handle_browser_key\n");
+
+    vim_handle_browser_key(&bv, &fbv, KEY(SDLK_3));
+    vim_handle_browser_key(&bv, &fbv, KEY(SDLK_j));
+    CHECK_EQ("'3j' moves the browser cursor down 3 more (clamped to last file)", fbv.cursor, 4);
+
+    fbv.cursor = 4;
+    vim_handle_browser_key(&bv, &fbv, KEY(SDLK_j));
+    CHECK_EQ("'j' at the last file stays clamped there", fbv.cursor, 4);
+
+    fbv.cursor = 4;
+    vim_handle_browser_key(&bv, &fbv, KEY(SDLK_k));
+    CHECK_EQ("'k' moves the browser cursor up one", fbv.cursor, 3);
+
+    fbv.cursor = 1;
+    vim_handle_browser_key(&bv, &fbv, KEY(SDLK_k));
+    vim_handle_browser_key(&bv, &fbv, KEY(SDLK_k));
+    CHECK_EQ("'k' at the first file stays clamped there", fbv.cursor, 0);
+
+    fbv.cursor = 2;
+    vim_handle_browser_key(&bv, &fbv, KEY_SHIFT(SDLK_g));
+    CHECK_EQ("'G' jumps to the last file", fbv.cursor, 4);
+
+    vim_handle_browser_key(&bv, &fbv, KEY(SDLK_g));
+    vim_handle_browser_key(&bv, &fbv, KEY(SDLK_g));
+    CHECK_EQ("'gg' jumps to the first file", fbv.cursor, 0);
+
+    fbv.cursor = 0;
+    browser_handled = vim_handle_browser_key(&bv, &fbv, KEY_CTRL(SDLK_z));
+    if (browser_handled) { printf("FAIL: Ctrl-combos should not be claimed by vim_handle_browser_key\n"); failures++; }
+    else printf("ok:   Ctrl-combos fall through vim_handle_browser_key\n");
+
+    fbv.cursor = 0;
+    browser_handled = vim_handle_browser_key(&bv, &fbv, KEY(SDLK_RETURN));
+    if (browser_handled) { printf("FAIL: Enter should not be claimed, so the caller's own open-file handling still runs\n"); failures++; }
+    else printf("ok:   Enter falls through vim_handle_browser_key\n");
 
     if (failures == 0) {
         printf("\nALL CHECKS PASSED\n");

@@ -609,3 +609,55 @@ bool vim_handle_key(Vim_State *vs, Editor *e, SDL_Keysym key)
     }
     return handled;
 }
+
+bool vim_handle_browser_key(Vim_State *vs, File_Browser *fb, SDL_Keysym key)
+{
+    bool shift = key.mod & KMOD_SHIFT;
+    bool ctrl  = key.mod & KMOD_CTRL;
+
+    if (ctrl) {
+        vs->count = 0;
+        return false;
+    }
+
+    if (!shift && key.sym >= SDLK_0 && key.sym <= SDLK_9 && !(key.sym == SDLK_0 && vs->count == 0)) {
+        vim_accumulate_count(vs, key.sym - SDLK_0);
+        return true;
+    }
+
+    if (vs->pending_g) {
+        vs->pending_g = false;
+        if (key.sym == SDLK_g && !shift) {
+            fb->cursor = 0;
+            vs->count = 0;
+            return true;
+        }
+    }
+
+    size_t count = vs->count ? vs->count : 1;
+    switch (key.sym) {
+    case SDLK_j:
+        fb->cursor += count;
+        if (fb->cursor >= fb->files.count) fb->cursor = fb->files.count ? fb->files.count - 1 : 0;
+        vs->count = 0;
+        return true;
+
+    case SDLK_k:
+        fb->cursor = (count <= fb->cursor) ? fb->cursor - count : 0;
+        vs->count = 0;
+        return true;
+
+    case SDLK_g:
+        if (shift) {
+            fb->cursor = fb->files.count ? fb->files.count - 1 : 0;
+            vs->count = 0;
+        } else {
+            vs->pending_g = true;
+        }
+        return true;
+
+    default:
+        vs->count = 0;
+        return false;
+    }
+}
