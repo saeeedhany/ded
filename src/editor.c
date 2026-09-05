@@ -6,6 +6,210 @@
 #include "./editor.h"
 #include "./common.h"
 
+#define UNDO_MERGE_MS 500
+
+static void editor_data_insert_at(Editor *e, size_t pos, const char *buf, size_t buf_len)
+{
+    if (pos > e->data.count) {
+        pos = e->data.count;
+    }
+
+    for (size_t i = 0; i < buf_len; ++i) {
+        da_append(&e->data, '\0');
+    }
+    memmove(
+        &e->data.items[pos + buf_len],
+        &e->data.items[pos],
+        e->data.count - pos - buf_len
+    );
+    memcpy(&e->data.items[pos], buf, buf_len);
+}
+
+static void editor_data_insert(Editor *e, const char *buf, size_t buf_len)
+{
+    editor_data_insert_at(e, e->cursor, buf, buf_len);
+    e->cursor += buf_len;
+}
+
+static void editor_data_remove(Editor *e, size_t pos, size_t len)
+{
+    if (pos > e->data.count) {
+        pos = e->data.count;
+    }
+    if (pos + len > e->data.count) {
+        len = e->data.count - pos;
+    }
+
+    memmove(
+        &e->data.items[pos],
+        &e->data.items[pos + len],
+        e->data.count - pos - len
+    );
+    e->data.count -= len;
+}
+
+static void editor_clear_redo(Editor *e)
+{
+    for (size_t i = 0; i < e->redo_stack.count; ++i) {
+        for (size_t j = 0; j < e->redo_stack.items[i].count; ++j) {
+            free(e->redo_stack.items[i].items[j].text.items);
+        }
+        free(e->redo_stack.items[i].items);
+    }
+    free(e->redo_stack.items);
+    e->redo_stack = (Edit_History){0};
+}
+
+void editor_flush_group(Editor *e)
+{
+    if (!e->group_open) return;
+    e->group_open = false;
+    e->group_time = 0;
+
+    da_append(&e->undo_stack, e->current_group);
+    e->current_group = (Edit_Ops){0};
+}
+
+static void editor_add_op(Editor *e, Edit_Kind kind, size_t pos, const char *text, size_t text_len)
+{
+    Uint32 now = SDL_GetTicks();
+    if (e->group_open && now - e->group_time > UNDO_MERGE_MS) {
+        editor_flush_group(e);
+    }
+    e->group_open = true;
+    e->group_time = now;
+
+    Edit_Op op = {
+        .kind = kind,
+        .pos = pos,
+        .text = {0},
+    };
+    sb_append_buf(&op.text, text, text_len);
+    da_append(&e->current_group, op);
+
+    editor_clear_redo(e);
+}
+
+static void editor_delete_selection(Editor *e)
+{
+    if (!e->selection) return;
+
+    size_t begin = e->select_begin;
+    size_t end = e->cursor;
+    if (begin > end) SWAP(size_t, begin, end);
+
+    e->selection = false;
+
+    if (begin == end) return;
+
+    size_t len = end - begin;
+    String_Builder sel_text = {0};
+    sb_append_buf(&sel_text, e->data.items + begin, len);
+
+    e->cursor = begin;
+    editor_data_remove(e, begin, len);
+    editor_add_op(e, EDIT_DELETE, begin, sel_text.items, sel_text.count);
+    free(sel_text.items);
+
+    editor_retokenize(e);
+}
+
+static void editor_apply_undo(Editor *e, Edit_Op *op)
+{
+    switch (op->kind) {
+    case EDIT_INSERT:
+        e->cursor = op->pos;
+        editor_data_remove(e, op->pos, op->text.count);
+        break;
+    case EDIT_DELETE:
+        e->cursor = op->pos;
+        editor_data_insert(e, op->text.items, op->text.count);
+        break;
+    }
+}
+
+static void editor_apply_redo(Editor *e, Edit_Op *op)
+{
+    switch (op->kind) {
+    case EDIT_INSERT:
+        e->cursor = op->pos;
+        editor_data_insert(e, op->text.items, op->text.count);
+        break;
+    case EDIT_DELETE:
+        e->cursor = op->pos;
+        editor_data_remove(e, op->pos, op->text.count);
+        break;
+    }
+}
+
+void editor_undo(Editor *e)
+{
+    editor_stop_search(e);
+    editor_flush_group(e);
+    if (e->undo_stack.count == 0) return;
+
+    Edit_Ops group = da_last(&e->undo_stack);
+    e->undo_stack.count -= 1;
+    da_append(&e->redo_stack, group);
+
+    e->selection = false;
+    for (size_t i = group.count; i > 0; --i) {
+        editor_apply_undo(e, &group.items[i - 1]);
+    }
+
+    editor_retokenize(e);
+    e->last_stroke = SDL_GetTicks();
+}
+
+void editor_redo(Editor *e)
+{
+    editor_stop_search(e);
+    editor_flush_group(e);
+    if (e->redo_stack.count == 0) return;
+
+    Edit_Ops group = da_last(&e->redo_stack);
+    e->redo_stack.count -= 1;
+    da_append(&e->undo_stack, group);
+
+    e->selection = false;
+    for (size_t i = 0; i < group.count; ++i) {
+        editor_apply_redo(e, &group.items[i]);
+    }
+
+    editor_retokenize(e);
+    e->last_stroke = SDL_GetTicks();
+}
+
+static void editor_free_history(Editor *e)
+{
+    for (size_t i = 0; i < e->undo_stack.count; ++i) {
+        for (size_t j = 0; j < e->undo_stack.items[i].count; ++j) {
+            free(e->undo_stack.items[i].items[j].text.items);
+        }
+        free(e->undo_stack.items[i].items);
+    }
+    free(e->undo_stack.items);
+
+    for (size_t i = 0; i < e->redo_stack.count; ++i) {
+        for (size_t j = 0; j < e->redo_stack.items[i].count; ++j) {
+            free(e->redo_stack.items[i].items[j].text.items);
+        }
+        free(e->redo_stack.items[i].items);
+    }
+    free(e->redo_stack.items);
+
+    for (size_t j = 0; j < e->current_group.count; ++j) {
+        free(e->current_group.items[j].text.items);
+    }
+    free(e->current_group.items);
+
+    e->undo_stack = (Edit_History){0};
+    e->redo_stack = (Edit_History){0};
+    e->current_group = (Edit_Ops){0};
+    e->group_open = false;
+    e->group_time = 0;
+}
+
 void editor_backspace(Editor *e)
 {
     if (e->searching) {
@@ -18,13 +222,16 @@ void editor_backspace(Editor *e)
         }
         if (e->cursor == 0) return;
 
-        memmove(
-            &e->data.items[e->cursor - 1],
-            &e->data.items[e->cursor],
-            e->data.count - e->cursor
-        );
-        e->cursor -= 1;
-        e->data.count -= 1;
+        if (e->selection) {
+            editor_delete_selection(e);
+            return;
+        }
+
+        size_t pos = e->cursor - 1;
+        char c = e->data.items[pos];
+        e->cursor = pos;
+        editor_data_remove(e, pos, 1);
+        editor_add_op(e, EDIT_DELETE, pos, &c, 1);
         editor_retokenize(e);
     }
 }
@@ -33,13 +240,15 @@ void editor_delete(Editor *e)
 {
     if (e->searching) return;
 
+    if (e->selection) {
+        editor_delete_selection(e);
+        return;
+    }
+
     if (e->cursor >= e->data.count) return;
-    memmove(
-        &e->data.items[e->cursor],
-        &e->data.items[e->cursor + 1],
-        e->data.count - e->cursor - 1
-    );
-    e->data.count -= 1;
+    char c = e->data.items[e->cursor];
+    editor_data_remove(e, e->cursor, 1);
+    editor_add_op(e, EDIT_DELETE, e->cursor, &c, 1);
     editor_retokenize(e);
 }
 
@@ -68,6 +277,8 @@ Errno editor_load_from_file(Editor *e, const char *file_path)
 {
     printf("Loading %s\n", file_path);
 
+    editor_free_history(e);
+
     e->data.count = 0;
     Errno err = read_entire_file(file_path, &e->data);
     if (err != 0) return err;
@@ -83,78 +294,197 @@ Errno editor_load_from_file(Editor *e, const char *file_path)
     return 0;
 }
 
-size_t editor_cursor_row(const Editor *e)
+size_t editor_row_at(const Editor *e, size_t pos)
 {
     assert(e->lines.count > 0);
     for (size_t row = 0; row < e->lines.count; ++row) {
         Line line = e->lines.items[row];
-        if (line.begin <= e->cursor && e->cursor <= line.end) {
+        if (line.begin <= pos && pos <= line.end) {
             return row;
         }
     }
     return e->lines.count - 1;
 }
 
+size_t editor_cursor_row(const Editor *e)
+{
+    return editor_row_at(e, e->cursor);
+}
+
+// ------------------------------------------------------------------------
+// Pure motions
+//
+// Each of these computes a target buffer position from an arbitrary
+// starting position `pos`. They never touch `e->cursor`, never call
+// `editor_stop_search`, and have no other side effects - they are plain
+// functions of (buffer, pos) -> pos.
+//
+// This is the shared core that normal-mode cursor movement, future
+// operator-pending ranges (e.g. `dw`, `ciw`), and visual-mode selection
+// extension all build on: one implementation, several consumers, instead
+// of the motion logic being welded to `e->cursor` mutation.
+// ------------------------------------------------------------------------
+
+size_t editor_find_line_up(const Editor *e, size_t pos)
+{
+    size_t row = editor_row_at(e, pos);
+    if (row == 0) return pos;
+    size_t col = pos - e->lines.items[row].begin;
+    Line prev_line = e->lines.items[row - 1];
+    size_t prev_line_size = prev_line.end - prev_line.begin;
+    if (col > prev_line_size) col = prev_line_size;
+    return prev_line.begin + col;
+}
+
+size_t editor_find_line_down(const Editor *e, size_t pos)
+{
+    size_t row = editor_row_at(e, pos);
+    if (row + 1 >= e->lines.count) return pos;
+    size_t col = pos - e->lines.items[row].begin;
+    Line next_line = e->lines.items[row + 1];
+    size_t next_line_size = next_line.end - next_line.begin;
+    if (col > next_line_size) col = next_line_size;
+    return next_line.begin + col;
+}
+
+size_t editor_find_char_left(const Editor *e, size_t pos)
+{
+    (void) e;
+    return pos > 0 ? pos - 1 : pos;
+}
+
+size_t editor_find_char_right(const Editor *e, size_t pos)
+{
+    return pos < e->data.count ? pos + 1 : pos;
+}
+
+size_t editor_find_word_left(const Editor *e, size_t pos)
+{
+    while (pos > 0 && !isalnum((unsigned char) e->data.items[pos - 1])) {
+        pos -= 1;
+    }
+    while (pos > 0 && isalnum((unsigned char) e->data.items[pos - 1])) {
+        pos -= 1;
+    }
+    return pos;
+}
+
+size_t editor_find_word_right(const Editor *e, size_t pos)
+{
+    while (pos < e->data.count && !isalnum((unsigned char) e->data.items[pos])) {
+        pos += 1;
+    }
+    while (pos < e->data.count && isalnum((unsigned char) e->data.items[pos])) {
+        pos += 1;
+    }
+    return pos;
+}
+
+// Vim's `e`: land ON the last character of the current/next word, as
+// opposed to `w`'s "start of the next word". Uses the same word
+// definition as word_left/word_right (maximal alnum run; everything
+// else is a separator) - this codebase does not distinguish punctuation
+// runs from word runs the way real Vim does, so `e` is an approximation
+// consistent with the rest of the file, not a full Vim word model.
+size_t editor_find_word_end(const Editor *e, size_t pos)
+{
+    size_t count = e->data.count;
+    if (count == 0) return pos;
+
+    // Always step forward at least once so repeated `e` presses advance
+    // instead of getting stuck once the cursor already sits on a word end.
+    if (pos + 1 >= count) return pos;
+    pos += 1;
+
+    while (pos < count && !isalnum((unsigned char) e->data.items[pos])) {
+        pos += 1;
+    }
+    if (pos >= count) return count - 1;
+
+    while (pos + 1 < count && isalnum((unsigned char) e->data.items[pos + 1])) {
+        pos += 1;
+    }
+    return pos;
+}
+
+size_t editor_find_line_begin(const Editor *e, size_t pos)
+{
+    size_t row = editor_row_at(e, pos);
+    return e->lines.items[row].begin;
+}
+
+size_t editor_find_line_end(const Editor *e, size_t pos)
+{
+    size_t row = editor_row_at(e, pos);
+    return e->lines.items[row].end;
+}
+
+size_t editor_find_paragraph_up(const Editor *e, size_t pos)
+{
+    size_t row = editor_row_at(e, pos);
+    while (row > 0 && e->lines.items[row].end - e->lines.items[row].begin <= 1) {
+        row -= 1;
+    }
+    while (row > 0 && e->lines.items[row].end - e->lines.items[row].begin > 1) {
+        row -= 1;
+    }
+    return e->lines.items[row].begin;
+}
+
+size_t editor_find_paragraph_down(const Editor *e, size_t pos)
+{
+    size_t row = editor_row_at(e, pos);
+    while (row + 1 < e->lines.count && e->lines.items[row].end - e->lines.items[row].begin <= 1) {
+        row += 1;
+    }
+    while (row + 1 < e->lines.count && e->lines.items[row].end - e->lines.items[row].begin > 1) {
+        row += 1;
+    }
+    return e->lines.items[row].begin;
+}
+
+// ------------------------------------------------------------------------
+// Cursor mutators
+//
+// Same observable behavior as before the refactor - they still stop an
+// active search and move `e->cursor` - just expressed as pure motion +
+// assignment so the pure motion can be reused elsewhere.
+// ------------------------------------------------------------------------
+
 void editor_move_line_up(Editor *e)
 {
     editor_stop_search(e);
-
-    size_t cursor_row = editor_cursor_row(e);
-    size_t cursor_col = e->cursor - e->lines.items[cursor_row].begin;
-    if (cursor_row > 0) {
-        Line next_line = e->lines.items[cursor_row - 1];
-        size_t next_line_size = next_line.end - next_line.begin;
-        if (cursor_col > next_line_size) cursor_col = next_line_size;
-        e->cursor = next_line.begin + cursor_col;
-    }
+    e->cursor = editor_find_line_up(e, e->cursor);
 }
 
 void editor_move_line_down(Editor *e)
 {
     editor_stop_search(e);
-
-    size_t cursor_row = editor_cursor_row(e);
-    size_t cursor_col = e->cursor - e->lines.items[cursor_row].begin;
-    if (cursor_row < e->lines.count - 1) {
-        Line next_line = e->lines.items[cursor_row + 1];
-        size_t next_line_size = next_line.end - next_line.begin;
-        if (cursor_col > next_line_size) cursor_col = next_line_size;
-        e->cursor = next_line.begin + cursor_col;
-    }
+    e->cursor = editor_find_line_down(e, e->cursor);
 }
 
 void editor_move_char_left(Editor *e)
 {
     editor_stop_search(e);
-    if (e->cursor > 0) e->cursor -= 1;
+    e->cursor = editor_find_char_left(e, e->cursor);
 }
 
 void editor_move_char_right(Editor *e)
 {
     editor_stop_search(e);
-    if (e->cursor < e->data.count) e->cursor += 1;
+    e->cursor = editor_find_char_right(e, e->cursor);
 }
 
 void editor_move_word_left(Editor *e)
 {
     editor_stop_search(e);
-    while (e->cursor > 0 && !isalnum(e->data.items[e->cursor - 1])) {
-        e->cursor -= 1;
-    }
-    while (e->cursor > 0 && isalnum(e->data.items[e->cursor - 1])) {
-        e->cursor -= 1;
-    }
+    e->cursor = editor_find_word_left(e, e->cursor);
 }
 
 void editor_move_word_right(Editor *e)
 {
     editor_stop_search(e);
-    while (e->cursor < e->data.count && !isalnum(e->data.items[e->cursor])) {
-        e->cursor += 1;
-    }
-    while (e->cursor < e->data.count && isalnum(e->data.items[e->cursor])) {
-        e->cursor += 1;
-    }
+    e->cursor = editor_find_word_right(e, e->cursor);
 }
 
 void editor_insert_char(Editor *e, char x)
@@ -179,19 +509,161 @@ void editor_insert_buf(Editor *e, char *buf, size_t buf_len)
         if (e->cursor > e->data.count) {
             e->cursor = e->data.count;
         }
-
-        for (size_t i = 0; i < buf_len; ++i) {
-            da_append(&e->data, '\0');
+        if (e->selection) {
+            editor_delete_selection(e);
         }
-        memmove(
-            &e->data.items[e->cursor + buf_len],
-            &e->data.items[e->cursor],
-            e->data.count - e->cursor - buf_len
-        );
-        memcpy(&e->data.items[e->cursor], buf, buf_len);
-        e->cursor += buf_len;
+
+        size_t pos = e->cursor;
+        editor_data_insert(e, buf, buf_len);
+        editor_add_op(e, EDIT_INSERT, pos, buf, buf_len);
         editor_retokenize(e);
     }
+}
+
+#define INDENT_WIDTH 4
+
+static size_t editor_row_of(const Editor *e, size_t pos)
+{
+    assert(e->lines.count > 0);
+    for (size_t row = 0; row < e->lines.count; ++row) {
+        Line line = e->lines.items[row];
+        if (line.begin <= pos && pos <= line.end) {
+            return row;
+        }
+    }
+    return e->lines.count - 1;
+}
+
+// Maps a pre-edit position to its position after every selected row `row_begin..row_end`
+// gained `deltas[r]` bytes (negative when bytes were removed). Works only while
+// `e->lines` still reflects the pre-edit layout.
+static size_t editor_apply_deltas(Editor *e, size_t pos, size_t row_begin, size_t row_end, const ptrdiff_t *deltas)
+{
+    ptrdiff_t shift = 0;
+    for (size_t r = row_begin; r <= row_end; ++r) {
+        if (e->lines.items[r].begin <= pos) {
+            shift += deltas[r];
+        }
+    }
+    return (size_t) ((ptrdiff_t) pos + shift);
+}
+
+void editor_indent(Editor *e)
+{
+    if (e->searching) return;
+
+    if (!e->selection) {
+        editor_insert_buf(e, "    ", INDENT_WIDTH);
+        return;
+    }
+
+    size_t begin = e->select_begin;
+    size_t end = e->cursor;
+    if (begin > end) SWAP(size_t, begin, end);
+
+    if (begin == end) {
+        e->selection = false;
+        editor_insert_buf(e, "    ", INDENT_WIDTH);
+        return;
+    }
+
+    size_t row_begin = editor_row_of(e, begin);
+    size_t row_end = editor_row_of(e, end);
+    if (row_end > row_begin && e->lines.items[row_end].begin == end) {
+        row_end -= 1; // the selection ends exactly where a line starts
+    }
+
+    ptrdiff_t *deltas = calloc(e->lines.count, sizeof(*deltas));
+
+    // Insert bottom-up so the shorter (upper) lines keep valid positions.
+    for (size_t r = row_end + 1; r > row_begin; --r) {
+        size_t rr = r - 1;
+        size_t at = e->lines.items[rr].begin;
+        editor_data_insert_at(e, at, "    ", INDENT_WIDTH);
+        editor_add_op(e, EDIT_INSERT, at, "    ", INDENT_WIDTH);
+        deltas[rr] = INDENT_WIDTH;
+    }
+
+    e->select_begin = editor_apply_deltas(e, begin, row_begin, row_end, deltas);
+    e->cursor = editor_apply_deltas(e, end, row_begin, row_end, deltas);
+    free(deltas);
+
+    editor_retokenize(e);
+    e->last_stroke = SDL_GetTicks();
+}
+
+void editor_unindent(Editor *e)
+{
+    if (e->searching) return;
+
+    if (!e->selection) {
+        size_t row = editor_row_of(e, e->cursor);
+        size_t at = e->lines.items[row].begin;
+        size_t end = e->lines.items[row].end;
+
+        size_t remove = 0;
+        while (remove < INDENT_WIDTH && at + remove < end && e->data.items[at + remove] == ' ') {
+            remove += 1;
+        }
+        if (remove == 0) return;
+
+        char spaces[INDENT_WIDTH] = {0};
+        memcpy(spaces, e->data.items + at, remove);
+        editor_data_remove(e, at, remove);
+        editor_add_op(e, EDIT_DELETE, at, spaces, remove);
+        if (e->cursor >= at + remove) {
+            e->cursor -= remove;
+        } else {
+            e->cursor = at;
+        }
+        editor_retokenize(e);
+        e->last_stroke = SDL_GetTicks();
+        return;
+    }
+
+    size_t begin = e->select_begin;
+    size_t end = e->cursor;
+    if (begin > end) SWAP(size_t, begin, end);
+
+    if (begin == end) {
+        e->selection = false;
+        editor_unindent(e);
+        return;
+    }
+
+    size_t row_begin = editor_row_of(e, begin);
+    size_t row_end = editor_row_of(e, end);
+    if (row_end > row_begin && e->lines.items[row_end].begin == end) {
+        row_end -= 1;
+    }
+
+    ptrdiff_t *deltas = calloc(e->lines.count, sizeof(*deltas));
+
+    // Remove bottom-up so the shorter (upper) lines keep valid positions.
+    char spaces[INDENT_WIDTH] = {0};
+    for (size_t r = row_end + 1; r > row_begin; --r) {
+        size_t rr = r - 1;
+        size_t at = e->lines.items[rr].begin;
+        size_t line_end = e->lines.items[rr].end;
+
+        size_t remove = 0;
+        while (remove < INDENT_WIDTH && at + remove < line_end && e->data.items[at + remove] == ' ') {
+            remove += 1;
+        }
+        if (remove == 0) continue;
+
+        memcpy(spaces, e->data.items + at, remove);
+        editor_data_remove(e, at, remove);
+        editor_add_op(e, EDIT_DELETE, at, spaces, remove);
+        deltas[rr] = -((ptrdiff_t) remove);
+    }
+
+    e->select_begin = editor_apply_deltas(e, begin, row_begin, row_end, deltas);
+    e->cursor = editor_apply_deltas(e, end, row_begin, row_end, deltas);
+    free(deltas);
+
+    editor_retokenize(e);
+    e->last_stroke = SDL_GetTicks();
 }
 
 void editor_retokenize(Editor *e)
@@ -366,6 +838,20 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
     simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
     {
         float CURSOR_WIDTH = 5.0f;
+        if (editor->cursor_block) {
+            // Normal-mode block cursor: fill the actual glyph cell under
+            // the cursor (its real advance width), not just a thicker bar.
+            // Falls back to the space glyph's width past end-of-buffer/line
+            // or for control characters like '\n', which aren't in the
+            // printable-ASCII metrics table.
+            unsigned char ch = ' ';
+            if (editor->cursor < editor->data.count) {
+                ch = (unsigned char) editor->data.items[editor->cursor];
+            }
+            if (ch < 32 || ch >= GLYPH_METRICS_CAPACITY) ch = ' ';
+            CURSOR_WIDTH = atlas->metrics[ch].ax;
+            if (CURSOR_WIDTH <= 0.0f) CURSOR_WIDTH = atlas->metrics[(unsigned char) ' '].ax;
+        }
         Uint32 CURSOR_BLINK_THRESHOLD = 500;
         Uint32 CURSOR_BLINK_PERIOD = 1000;
         Uint32 t = SDL_GetTicks() - editor->last_stroke;
@@ -434,12 +920,21 @@ void editor_clipboard_copy(Editor *e)
         if (begin > end) SWAP(size_t, begin, end);
 
         e->clipboard.count = 0;
-        sb_append_buf(&e->clipboard, &e->data.items[begin], end - begin + 1);
+        sb_append_buf(&e->clipboard, &e->data.items[begin], end - begin);
         sb_append_null(&e->clipboard);
 
         if (SDL_SetClipboardText(e->clipboard.items) < 0) {
             fprintf(stderr, "ERROR: SDL ERROR: %s\n", SDL_GetError());
         }
+    }
+}
+
+void editor_clipboard_cut(Editor *e)
+{
+    if (e->searching) return;
+    if (e->selection) {
+        editor_clipboard_copy(e);
+        editor_delete_selection(e);
     }
 }
 
@@ -506,39 +1001,23 @@ void editor_move_to_end(Editor *e)
 void editor_move_to_line_begin(Editor *e)
 {
     editor_stop_search(e);
-    size_t row = editor_cursor_row(e);
-    e->cursor = e->lines.items[row].begin;
+    e->cursor = editor_find_line_begin(e, e->cursor);
 }
 
 void editor_move_to_line_end(Editor *e)
 {
     editor_stop_search(e);
-    size_t row = editor_cursor_row(e);
-    e->cursor = e->lines.items[row].end;
+    e->cursor = editor_find_line_end(e, e->cursor);
 }
 
 void editor_move_paragraph_up(Editor *e)
 {
     editor_stop_search(e);
-    size_t row = editor_cursor_row(e);
-    while (row > 0 && e->lines.items[row].end - e->lines.items[row].begin <= 1) {
-        row -= 1;
-    }
-    while (row > 0 && e->lines.items[row].end - e->lines.items[row].begin > 1) {
-        row -= 1;
-    }
-    e->cursor = e->lines.items[row].begin;
+    e->cursor = editor_find_paragraph_up(e, e->cursor);
 }
 
 void editor_move_paragraph_down(Editor *e)
 {
     editor_stop_search(e);
-    size_t row = editor_cursor_row(e);
-    while (row + 1 < e->lines.count && e->lines.items[row].end - e->lines.items[row].begin <= 1) {
-        row += 1;
-    }
-    while (row + 1 < e->lines.count && e->lines.items[row].end - e->lines.items[row].begin > 1) {
-        row += 1;
-    }
-    e->cursor = e->lines.items[row].begin;
+    e->cursor = editor_find_paragraph_down(e, e->cursor);
 }
