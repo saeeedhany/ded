@@ -76,6 +76,19 @@ Stack: SDL2 + OpenGL 3.3 + GLEW + FreeType, using hand-rolled data structures (d
 - **The bottom bar could overflow past the window.** It originally rode the document's own live `sr->camera_pos`/`camera_scale`, so it zoomed with the document — and the document's auto-zoom goes extreme on a near-empty buffer (the target scale divides by the longest visible line's length), blowing the bar up well past the window edges. Fixed by giving `draw_bottom_bar` its own fixed camera transform (`UI_TEXT_SCALE`), saved and restored around the draw call, so the bar is now always exactly `UI_BAR_HEIGHT_PX` screen pixels tall regardless of window size or the document's zoom.
 - **Confirming a prompt (e.g. `y` for "new file, discard changes?") could leak that letter into the buffer.** Same root cause as 2.5's `i` bug, in a new spot: pressing `y` exits `APP_MODE_CONFIRM` back to `APP_MODE_EDITOR` within the same keystroke, so the trailing `SDL_TEXTINPUT('y')` arrives already in editor mode — and if Vim was still in Insert mode underneath (e.g. the user hadn't pressed Escape before triggering Ctrl+N), it got typed into the freshly-created buffer. Generalized the same "did this key just get consumed by a mode I've since left" pattern one level up: `app_mode_changed_this_key` is set whenever an `SDL_KEYDOWN` changes `mode`, and `SDL_TEXTINPUT` swallows unconditionally when it's set, regardless of which mode was switched *into*. This subsumes the old `APP_MODE_CONFIRM`-specific no-op and fixes the symmetric case (`n`/Escape cancelling) too, not just `y`.
 
+### 2.8 Command registry, data-driven keymap, and a config file
+`src/command.h`, `src/command.c` (new), `src/config.h`, `src/config.c` (new), `src/editor.h`, `src/editor.c`, `src/main.c`, `src/tes_command.c` (new, headless test)
+
+Architectural groundwork, not a user-facing feature by itself: `main.c`'s ~240-line `switch (event.key.keysym.sym)` for Normal-mode editor keys (the one thing standing in the way of configurable keybindings, and the thing a future plugin system would otherwise have to edit directly) is gone, replaced by two new, narrow, dependency-free modules:
+
+- **`command.c`**: a registry of named, zero-argument `Command`s (`command_register`/`command_find`), and a `Keybinding` table resolving an exact key+Ctrl+Shift chord to one (`keymap_bind`/`keymap_resolve`). Knows nothing about the editor, Vim, or anything else in this app — deliberately, so it stays usable as-is if a scripting layer registers its own commands later. `keymap_bind` replaces an existing binding for the same chord in place rather than shadowing it with a duplicate, which is what lets a config override "just work" against a built-in default.
+- **`config.c`**: loads a simple `key = value` / `bind <chord> = <command>` file (`#` comments, one setting per line) on top of `config_default()`'s values. A missing file is the expected common case (not an error); a line it can't parse is reported to stderr and skipped, never fatal to the rest of the file. `bind` lines call `keymap_bind` directly, so config-driven and built-in keybindings go through the exact same parser and the exact same table.
+- **`main.c`** now holds ~30 small `cmd_*` functions (one per actual action — `cmd_move_char_left`, `cmd_save`, `cmd_undo`, ...) plus two static tables: `default_commands[]` registers all of them, `default_keybindings[]` binds ~44 chords to them. `register_default_commands_and_keymap()` runs both before `config_load()`, so a user's `bind` line overrides a default instead of racing it. Shift-as-"extend the current selection" (arrows, Home/End, Escape) is handled once, generically, by the dispatcher — via each command's `shift_extends_selection` flag — rather than by every movement command calling `editor_update_selection` itself.
+- **`Editor::indent_width`** replaces the old compile-time `INDENT_WIDTH` macro, so `tab_width` in the config file actually does something; capped at the new `EDITOR_MAX_INDENT_WIDTH` (16), which sizes `editor_indent`/`editor_unindent`'s scratch buffers.
+- Three small, deliberate behavior simplifications made along the way (none were an intentional design choice in the original switch - just modifiers it never bothered checking because it didn't need to for a single hardcoded binding): Backspace/Delete/Return/F2/F3/F5 no longer also fire with Ctrl and/or Shift incidentally held; Escape no longer also fires on Ctrl+Escape; Tab/Shift+Tab no longer also fire on Ctrl+Tab/Ctrl+Shift+Tab, freeing those chords for a future tab-switching feature instead of silently indenting.
+- One accepted, narrow behavior change from the refactor itself: Escape's Shift-extends-selection handling now runs *before* `editor_stop_search` instead of after (the dispatcher always resolves shift first, generically), so `editor_update_selection`'s own `if (e->searching) return` guard can now suppress it in the specific case of Shift+Escape pressed while both searching and holding a selection. A zero-argument command can't reproduce ordering that depends on the specific event that resolved to it; this combination was judged too obscure to be worth breaking that abstraction over.
+- `./ded.conf` (repo/cwd-relative — not yet an XDG-style user config path, a natural follow-up) is loaded unconditionally at startup; `font`, `tab_width`, and arbitrary `bind` overrides are all it understands so far. Colors/theming are not configurable yet.
+
 ## 3. Notes / known quirks
 
 - Undo/redo place the caret at the start (undo) or end (redo) of the change; exact caret restoration is not implemented.
@@ -86,14 +99,16 @@ Stack: SDL2 + OpenGL 3.3 + GLEW + FreeType, using hand-rolled data structures (d
 ## 4. What is left (roadmap, in rough priority order)
 
 1. ~~**Unsaved-changes prompt**~~ / ~~**Save-as / new-file dialog**~~ — done, see §2.6.
-2. **Line numbers + status bar** — line:col, filename, dirty indicator (a permanent one — §2.6's bottom bar only appears for prompts/errors, not standing status), adjustable horizontal scroll.
-3. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
-4. **File-browser search** — type to filter the file list (TODO in `src/main.c`).
-5. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
-6. **Editing polish** — delete word, replace.
-7. **Multiple buffers / tabs**, split view, project-wide search, git integration.
-8. **Mouse support** — click to place cursor, wheel scroll, drag to select.
-9. **Config** — theme, font choice (currently hardcoded Iosevka), tab width, keybindings.
+2. ~~**Config**~~ — font path, tab width, and keybinding overrides done, see §2.8. Theme/color config is the missing piece (below).
+3. **Line numbers + status bar** — line:col, filename, dirty indicator (a permanent one — §2.6's bottom bar only appears for prompts/errors, not standing status), adjustable horizontal scroll.
+4. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
+5. **File-browser search** — type to filter the file list (TODO in `src/main.c`).
+6. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
+7. **Editing polish** — delete word, replace.
+8. **Multiple buffers / tabs**, split view, project-wide search, git integration.
+9. **Mouse support** — click to place cursor, wheel scroll, drag to select.
+10. **Theme/color config** — background, selection, syntax-highlight, and UI-bar colors are still hardcoded hex literals in `editor.c`/`main.c`; a natural next slice of §2.8's config file.
+11. **Plugin/scripting layer** — deliberately not started (see §2.8's intro): `command_register`/`keymap_bind` are the seam it would attach to (a script registers its own commands and binds keys to them, the same way `main.c`'s own defaults do), but there's no embedded language yet. Lua is the natural choice if/when this is worth doing (small, fast, trivial to vendor, and the proven model for exactly this kind of editor).
 
 ### 4.1 Vim modal editing — what's left (see `src/vim.h`'s header comment for the authoritative scope notes)
 

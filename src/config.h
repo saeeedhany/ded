@@ -1,0 +1,35 @@
+#ifndef CONFIG_H_
+#define CONFIG_H_
+
+#include "./common.h"
+
+#define CONFIG_FONT_PATH_CAP 512
+
+typedef struct {
+    char font_path[CONFIG_FONT_PATH_CAP];
+    size_t tab_width;
+} Config;
+
+// Built-in defaults - what the editor uses with no config file, or for
+// any setting a config file doesn't mention. Not the same as `Config{0}`:
+// a zeroed Config has an empty font_path and tab_width 0, neither of
+// which is a usable value (see Editor::indent_width's own comment on
+// the tab_width==0 case).
+Config config_default(void);
+
+// Loads `path` on top of `*cfg` (already holding at least
+// config_default()'s values), applying only the settings the file
+// actually mentions. A missing file is the expected common case, not a
+// fault: `*cfg` is left untouched and this returns 0. Any `bind <chord>
+// = <command>` line calls keymap_bind (see command.h) directly, so
+// config-driven keybindings and the built-in defaults go through the
+// exact same parser and the exact same keymap - a config bind for a
+// chord that's already bound (built-in or from an earlier config line)
+// replaces it rather than adding a second, shadowed entry. A line this
+// can't parse (bad syntax, unknown key, unrecognized chord or command
+// name) is reported to stderr and skipped - never fatal to the rest of
+// the file, since a config file is user-editable text a typo shouldn't
+// brick the editor over.
+Errno config_load(const char *path, Config *cfg);
+
+#endif // CONFIG_H_

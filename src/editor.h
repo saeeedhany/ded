@@ -49,6 +49,13 @@ typedef struct {
     size_t capacity;
 } Edit_History;
 
+// Hard cap on Editor::indent_width - not a "reasonable default", just
+// the size of the on-stack scratch buffers editor_indent/editor_unindent
+// use to avoid a heap allocation for something this small. config_load
+// clamps into this range; editor_new_file/editor_load_from_file don't
+// touch indent_width at all (it's a user setting, not per-buffer state).
+#define EDITOR_MAX_INDENT_WIDTH 16
+
 typedef struct {
     Free_Glyph_Atlas *atlas;
 
@@ -91,6 +98,16 @@ typedef struct {
     // before destructive actions (opening another file, quitting) and
     // confirm with the user first.
     bool dirty;
+
+    // How many spaces Tab/editor_indent inserts (and Shift-Tab/
+    // editor_unindent removes up to). A user setting, not per-buffer
+    // state - editor_new_file/editor_load_from_file leave it alone.
+    // Zero-initializing an Editor ({0}) leaves this 0, which makes Tab a
+    // silent no-op rather than a crash - harmless, but not the intended
+    // default of 4, so main.c sets this explicitly at startup from
+    // Config right after zero-initializing `editor` (see config.h).
+    // Clamped to EDITOR_MAX_INDENT_WIDTH.
+    size_t indent_width;
 } Editor;
 
 Errno editor_save_as(Editor *editor, const char *file_path);

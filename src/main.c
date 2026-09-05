@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <string.h>
+#include <assert.h>
 
 #include <SDL2/SDL.h>
 #define GLEW_STATIC
@@ -23,8 +24,12 @@
 #include "./lexer.h"
 #include "./sv.h"
 #include "./vim.h"
+#include "./command.h"
+#include "./config.h"
 
 // TODO: Delete a word
+
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 void MessageCallback(GLenum source,
                      GLenum type,
@@ -205,10 +210,392 @@ static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const 
     sr->camera_scale = saved_camera_scale;
 }
 
+// ------------------------------------------------------------------------
+// Commands
+//
+// Each of these is a registered Command (see command.h) - the thing a
+// keybinding (built-in, or a config `bind` line) actually resolves to
+// and runs. They're plain zero-argument functions reading/writing this
+// file's static globals, same as the rest of main.c always has -
+// nothing here is more "special" than a normal function, it's just
+// reachable by name through command_find/keymap_resolve instead of only
+// by a hardcoded switch case. This is the seam a config file's
+// keybinding overrides attach to now, and where a future plugin/
+// scripting layer would register its own commands alongside these.
+//
+// Movement commands (shift_extends_selection = true at registration,
+// below) don't call editor_update_selection themselves - the dispatcher
+// does that once, generically, for any command registered that way,
+// right before calling it.
+// ------------------------------------------------------------------------
+
+static void cmd_move_line_begin(void)
+{
+    editor_flush_group(&editor);
+    editor_move_to_line_begin(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_buffer_begin(void)
+{
+    editor_flush_group(&editor);
+    editor_move_to_begin(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_line_end(void)
+{
+    editor_flush_group(&editor);
+    editor_move_to_line_end(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_buffer_end(void)
+{
+    editor_flush_group(&editor);
+    editor_move_to_end(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_char_left(void)
+{
+    editor_flush_group(&editor);
+    editor_move_char_left(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_word_left(void)
+{
+    editor_flush_group(&editor);
+    editor_move_word_left(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_char_right(void)
+{
+    editor_flush_group(&editor);
+    editor_move_char_right(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_word_right(void)
+{
+    editor_flush_group(&editor);
+    editor_move_word_right(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_line_up(void)
+{
+    editor_flush_group(&editor);
+    editor_move_line_up(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_paragraph_up(void)
+{
+    editor_flush_group(&editor);
+    editor_move_paragraph_up(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_line_down(void)
+{
+    editor_flush_group(&editor);
+    editor_move_line_down(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_move_paragraph_down(void)
+{
+    editor_flush_group(&editor);
+    editor_move_paragraph_down(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_backspace(void)
+{
+    editor_backspace(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_delete_forward(void)
+{
+    editor_delete(&editor);
+    editor.last_stroke = SDL_GetTicks();
+}
+
+static void cmd_save(void)
+{
+    if (editor.file_path.count > 0) {
+        editor_flush_group(&editor);
+        Errno err = editor_save(&editor);
+        if (err != 0) {
+            flash_error("Could not save currently edited file: %s", strerror(err));
+        } else {
+            editor.dirty = false;
+        }
+    } else {
+        editor_flush_group(&editor);
+        save_as_path[0] = '\0';
+        save_as_path_len = 0;
+        mode = APP_MODE_SAVE_AS;
+    }
+}
+
+static void cmd_save_as(void)
+{
+    editor_flush_group(&editor);
+    save_as_path[0] = '\0';
+    save_as_path_len = 0;
+    if (editor.file_path.count > 0) {
+        snprintf(save_as_path, SAVE_AS_PATH_CAP, "%s", editor.file_path.items);
+        save_as_path_len = strlen(save_as_path);
+    }
+    mode = APP_MODE_SAVE_AS;
+}
+
+static void cmd_open_file_browser(void)
+{
+    request_action(CONFIRM_ACTION_OPEN_BROWSER);
+}
+
+static void cmd_new_file(void)
+{
+    request_action(CONFIRM_ACTION_NEW_FILE);
+}
+
+static void cmd_quit(void)
+{
+    request_action(CONFIRM_ACTION_QUIT);
+}
+
+static void cmd_reload_shaders(void)
+{
+    simple_renderer_reload_shaders(&sr);
+}
+
+static void cmd_undo(void)
+{
+    editor_undo(&editor);
+}
+
+static void cmd_redo(void)
+{
+    editor_redo(&editor);
+}
+
+static void cmd_confirm_line(void)
+{
+    if (editor.searching) {
+        editor_flush_group(&editor);
+        editor_stop_search(&editor);
+    } else {
+        editor_insert_char(&editor, '\n');
+        editor.last_stroke = SDL_GetTicks();
+    }
+}
+
+static void cmd_start_search(void)
+{
+    editor_flush_group(&editor);
+    editor_start_search(&editor);
+}
+
+// Registered with shift_extends_selection = true, same as the movement
+// commands - but unlike them, the order that matters (relative to
+// editor_stop_search) doesn't quite line up with the dispatcher's
+// "update selection, then run the command" sequencing: the original
+// code called editor_update_selection AFTER stop_search, and
+// editor_update_selection no-ops while e->searching is true. So in the
+// rare case of pressing Escape+Shift while both searching AND holding a
+// selection, this no longer clears that selection the way the original
+// code did. Deliberately accepted: a zero-argument command can't
+// replicate ordering that depends on the specific event that resolved
+// to it, and this combination is obscure enough not to be worth
+// breaking that abstraction over.
+static void cmd_escape(void)
+{
+    editor_flush_group(&editor);
+    editor_stop_search(&editor);
+}
+
+static void cmd_select_all(void)
+{
+    editor_flush_group(&editor);
+    editor.selection = true;
+    editor.select_begin = 0;
+    editor.cursor = editor.data.count;
+}
+
+static void cmd_indent(void)
+{
+    editor_indent(&editor);
+}
+
+static void cmd_unindent(void)
+{
+    editor_unindent(&editor);
+}
+
+static void cmd_copy(void)
+{
+    editor_flush_group(&editor);
+    editor_clipboard_copy(&editor);
+}
+
+static void cmd_cut(void)
+{
+    editor_flush_group(&editor);
+    editor_clipboard_cut(&editor);
+}
+
+static void cmd_paste(void)
+{
+    editor_flush_group(&editor);
+    editor_clipboard_paste(&editor);
+}
+
+typedef struct {
+    const char *name;
+    Command_Fn fn;
+    bool shift_extends_selection;
+} Command_Def;
+
+static const Command_Def default_commands[] = {
+    {"move-line-begin",     cmd_move_line_begin,     true},
+    {"move-buffer-begin",   cmd_move_buffer_begin,   true},
+    {"move-line-end",       cmd_move_line_end,       true},
+    {"move-buffer-end",     cmd_move_buffer_end,     true},
+    {"move-char-left",      cmd_move_char_left,      true},
+    {"move-word-left",      cmd_move_word_left,      true},
+    {"move-char-right",     cmd_move_char_right,     true},
+    {"move-word-right",     cmd_move_word_right,     true},
+    {"move-line-up",        cmd_move_line_up,        true},
+    {"move-paragraph-up",   cmd_move_paragraph_up,   true},
+    {"move-line-down",      cmd_move_line_down,      true},
+    {"move-paragraph-down", cmd_move_paragraph_down, true},
+    {"escape",              cmd_escape,              true},
+
+    {"backspace",           cmd_backspace,           false},
+    {"delete-forward",      cmd_delete_forward,      false},
+    {"save",                cmd_save,                false},
+    {"save-as",             cmd_save_as,             false},
+    {"open-file-browser",   cmd_open_file_browser,   false},
+    {"new-file",            cmd_new_file,            false},
+    {"quit",                cmd_quit,                false},
+    {"reload-shaders",      cmd_reload_shaders,      false},
+    {"undo",                cmd_undo,                false},
+    {"redo",                cmd_redo,                false},
+    {"confirm-line",        cmd_confirm_line,        false},
+    {"start-search",        cmd_start_search,        false},
+    {"select-all",          cmd_select_all,          false},
+    {"indent",              cmd_indent,              false},
+    {"unindent",            cmd_unindent,            false},
+    {"copy",                cmd_copy,                false},
+    {"cut",                 cmd_cut,                 false},
+    {"paste",               cmd_paste,               false},
+};
+
+typedef struct {
+    const char *chord;
+    const char *command;
+} Keybind_Def;
+
+// The built-in keymap. Every entry a movement/escape command needs is
+// listed twice (bare and Shift-prefixed) since shift_extends_selection
+// is handled generically by the dispatcher rather than by matching a
+// "don't care about Shift" wildcard chord - see command.h.
+//
+// Three spots deliberately do NOT replicate a modifier-agnostic quirk
+// the original hardcoded switch had (nobody chose it - the switch
+// simply never bothered checking a modifier it didn't need):
+//   - Backspace/Delete/Return/F2/F3/F5 no longer also fire when Ctrl
+//     and/or Shift happen to be held alongside them.
+//   - Escape no longer also fires on Ctrl+Escape (an OS-level shortcut
+//     on some platforms anyway - not claiming it is arguably safer).
+//   - Tab/Shift+Tab no longer also fire on Ctrl+Tab/Ctrl+Shift+Tab,
+//     which frees those up for a future tab-switching feature (Ctrl+Tab
+//     is the near-universal convention for it) instead of indenting.
+static const Keybind_Def default_keybindings[] = {
+    {"home",             "move-line-begin"},
+    {"shift+home",       "move-line-begin"},
+    {"ctrl+home",        "move-buffer-begin"},
+    {"ctrl+shift+home",  "move-buffer-begin"},
+    {"end",              "move-line-end"},
+    {"shift+end",        "move-line-end"},
+    {"ctrl+end",         "move-buffer-end"},
+    {"ctrl+shift+end",   "move-buffer-end"},
+    {"left",             "move-char-left"},
+    {"shift+left",       "move-char-left"},
+    {"ctrl+left",        "move-word-left"},
+    {"ctrl+shift+left",  "move-word-left"},
+    {"right",            "move-char-right"},
+    {"shift+right",      "move-char-right"},
+    {"ctrl+right",       "move-word-right"},
+    {"ctrl+shift+right", "move-word-right"},
+    {"up",               "move-line-up"},
+    {"shift+up",         "move-line-up"},
+    {"ctrl+up",          "move-paragraph-up"},
+    {"ctrl+shift+up",    "move-paragraph-up"},
+    {"down",             "move-line-down"},
+    {"shift+down",       "move-line-down"},
+    {"ctrl+down",        "move-paragraph-down"},
+    {"ctrl+shift+down",  "move-paragraph-down"},
+    {"escape",           "escape"},
+    {"shift+escape",     "escape"},
+
+    {"backspace",        "backspace"},
+    {"delete",           "delete-forward"},
+    {"f2",               "save"},
+    {"ctrl+shift+s",     "save-as"},
+    {"f3",               "open-file-browser"},
+    {"ctrl+n",           "new-file"},
+    {"ctrl+q",           "quit"},
+    {"f5",               "reload-shaders"},
+    {"ctrl+z",           "undo"},
+    {"ctrl+shift+z",     "redo"},
+    {"ctrl+y",           "redo"},
+    {"return",           "confirm-line"},
+    {"ctrl+f",           "start-search"},
+    {"ctrl+a",           "select-all"},
+    {"tab",              "indent"},
+    {"shift+tab",        "unindent"},
+    {"ctrl+c",           "copy"},
+    {"ctrl+x",           "cut"},
+    {"ctrl+v",           "paste"},
+};
+
+// Registers every built-in command and binds every built-in keybinding.
+// Must run before config_load, so a `bind` line in the user's config
+// overrides (rather than races) a default rather than the other way
+// around - keymap_bind replaces an existing entry for the same chord in
+// place (see command.h) instead of adding a shadowed duplicate.
+static void register_default_commands_and_keymap(void)
+{
+    for (size_t i = 0; i < ARRAY_LEN(default_commands); ++i) {
+        const Command_Def *def = &default_commands[i];
+        command_register(def->name, def->fn, def->shift_extends_selection);
+    }
+    for (size_t i = 0; i < ARRAY_LEN(default_keybindings); ++i) {
+        const Keybind_Def *def = &default_keybindings[i];
+        bool ok = keymap_bind(def->chord, def->command);
+        assert(ok && "a built-in keybinding failed to bind - this is a bug in default_keybindings/default_commands itself, not a runtime condition");
+    }
+}
 
 int main(int argc, char **argv)
 {
     Errno err;
+
+    register_default_commands_and_keymap();
+
+    Config cfg = config_default();
+    err = config_load("./ded.conf", &cfg);
+    if (err != 0) {
+        fprintf(stderr, "WARNING: could not read ./ded.conf: %s\n", strerror(err));
+    }
+    editor.indent_width = cfg.tab_width;
 
     FT_Library library = {0};
 
@@ -218,17 +605,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // TODO: users should be able to customize the font
-    // const char *const font_file_path = "./fonts/VictorMono-Regular.ttf";
-    const char *const font_file_path = "./fonts/iosevka-regular.ttf";
-
     FT_Face face;
-    error = FT_New_Face(library, font_file_path, 0, &face);
+    error = FT_New_Face(library, cfg.font_path, 0, &face);
     if (error == FT_Err_Unknown_File_Format) {
-        fprintf(stderr, "ERROR: `%s` has an unknown format\n", font_file_path);
+        fprintf(stderr, "ERROR: `%s` has an unknown format\n", cfg.font_path);
         return 1;
     } else if (error) {
-        fprintf(stderr, "ERROR: Could not load file `%s`\n", font_file_path);
+        fprintf(stderr, "ERROR: Could not load file `%s`\n", cfg.font_path);
         return 1;
     }
 
@@ -452,236 +835,13 @@ int main(int argc, char **argv)
                     if (vim_handle_key(&vim, &editor, event.key.keysym)) {
                         editor.last_stroke = SDL_GetTicks();
                     } else {
-                    switch (event.key.keysym.sym) {
-                    case SDLK_HOME: {
-                        editor_flush_group(&editor);
-                        editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_move_to_begin(&editor);
-                        } else {
-                            editor_move_to_line_begin(&editor);
-                        }
-                        editor.last_stroke = SDL_GetTicks();
-                    } break;
-
-                    case SDLK_END: {
-                        editor_flush_group(&editor);
-                        editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_move_to_end(&editor);
-                        } else {
-                            editor_move_to_line_end(&editor);
-                        }
-                        editor.last_stroke = SDL_GetTicks();
-                    } break;
-
-                    case SDLK_BACKSPACE: {
-                        editor_backspace(&editor);
-                        editor.last_stroke = SDL_GetTicks();
-                    }
-                    break;
-
-                    case SDLK_F2: {
-                        if (editor.file_path.count > 0) {
-                            editor_flush_group(&editor);
-                            err = editor_save(&editor);
-                            if (err != 0) {
-                                flash_error("Could not save currently edited file: %s", strerror(err));
-                            } else {
-                                editor.dirty = false;
+                        const Command *cmd = keymap_resolve(event.key.keysym);
+                        if (cmd != NULL) {
+                            if (cmd->shift_extends_selection) {
+                                editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
                             }
-                        } else {
-                            editor_flush_group(&editor);
-                            save_as_path[0] = '\0';
-                            save_as_path_len = 0;
-                            mode = APP_MODE_SAVE_AS;
+                            cmd->fn();
                         }
-                    }
-                    break;
-
-                    case SDLK_F3: {
-                        request_action(CONFIRM_ACTION_OPEN_BROWSER);
-                    }
-                    break;
-
-                    case SDLK_n: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            request_action(CONFIRM_ACTION_NEW_FILE);
-                        }
-                    }
-                    break;
-
-                    case SDLK_q: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            request_action(CONFIRM_ACTION_QUIT);
-                        }
-                    }
-                    break;
-
-                    case SDLK_s: {
-                        if ((event.key.keysym.mod & KMOD_CTRL) && (event.key.keysym.mod & KMOD_SHIFT)) {
-                            editor_flush_group(&editor);
-                            save_as_path[0] = '\0';
-                            save_as_path_len = 0;
-                            if (editor.file_path.count > 0) {
-                                snprintf(save_as_path, SAVE_AS_PATH_CAP, "%s", editor.file_path.items);
-                                save_as_path_len = strlen(save_as_path);
-                            }
-                            mode = APP_MODE_SAVE_AS;
-                        }
-                    }
-                    break;
-
-                    case SDLK_F5: {
-                        simple_renderer_reload_shaders(&sr);
-                    }
-                    break;
-
-                    case SDLK_z: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            if (event.key.keysym.mod & KMOD_SHIFT) {
-                                editor_redo(&editor);
-                            } else {
-                                editor_undo(&editor);
-                            }
-                        }
-                    }
-                    break;
-
-                    case SDLK_y: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_redo(&editor);
-                        }
-                    }
-                    break;
-
-                    case SDLK_RETURN: {
-                        if (editor.searching) {
-                            editor_flush_group(&editor);
-                            editor_stop_search(&editor);
-                        } else {
-                            editor_insert_char(&editor, '\n');
-                            editor.last_stroke = SDL_GetTicks();
-                        }
-                    }
-                    break;
-
-                    case SDLK_DELETE: {
-                        editor_delete(&editor);
-                        editor.last_stroke = SDL_GetTicks();
-                    }
-                    break;
-
-                    case SDLK_f: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_flush_group(&editor);
-                            editor_start_search(&editor);
-                        }
-                    }
-                    break;
-
-                    case SDLK_ESCAPE: {
-                        editor_flush_group(&editor);
-                        editor_stop_search(&editor);
-                        editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
-                    }
-                    break;
-
-                    case SDLK_a: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_flush_group(&editor);
-                            editor.selection = true;
-                            editor.select_begin = 0;
-                            editor.cursor = editor.data.count;
-                        }
-                    }
-                    break;
-
-                    case SDLK_TAB: {
-                        // TODO: customizable indentation style
-                        // - tabs/spaces
-                        // - tab width
-                        // - etc.
-                        if (event.key.keysym.mod & KMOD_SHIFT) {
-                            editor_unindent(&editor);
-                        } else {
-                            editor_indent(&editor);
-                        }
-                    }
-                    break;
-
-                    case SDLK_c: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_flush_group(&editor);
-                            editor_clipboard_copy(&editor);
-                        }
-                    }
-                    break;
-
-                    case SDLK_x: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_flush_group(&editor);
-                            editor_clipboard_cut(&editor);
-                        }
-                    }
-                    break;
-
-                    case SDLK_v: {
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_flush_group(&editor);
-                            editor_clipboard_paste(&editor);
-                        }
-                    }
-                    break;
-
-                    case SDLK_UP: {
-                        editor_flush_group(&editor);
-                        editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_move_paragraph_up(&editor);
-                        } else {
-                            editor_move_line_up(&editor);
-                        }
-                        editor.last_stroke = SDL_GetTicks();
-                    }
-                    break;
-
-                    case SDLK_DOWN: {
-                        editor_flush_group(&editor);
-                        editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_move_paragraph_down(&editor);
-                        } else {
-                            editor_move_line_down(&editor);
-                        }
-                        editor.last_stroke = SDL_GetTicks();
-                    }
-                    break;
-
-                    case SDLK_LEFT: {
-                        editor_flush_group(&editor);
-                        editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_move_word_left(&editor);
-                        } else {
-                            editor_move_char_left(&editor);
-                        }
-                        editor.last_stroke = SDL_GetTicks();
-                    }
-                    break;
-
-                    case SDLK_RIGHT: {
-                        editor_flush_group(&editor);
-                        editor_update_selection(&editor, event.key.keysym.mod & KMOD_SHIFT);
-                        if (event.key.keysym.mod & KMOD_CTRL) {
-                            editor_move_word_right(&editor);
-                        } else {
-                            editor_move_char_right(&editor);
-                        }
-                        editor.last_stroke = SDL_GetTicks();
-                    }
-                    break;
-                    }
                     }
                 } break;
                 }

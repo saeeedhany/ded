@@ -549,8 +549,6 @@ void editor_insert_buf(Editor *e, char *buf, size_t buf_len)
     }
 }
 
-#define INDENT_WIDTH 4
-
 static size_t editor_row_of(const Editor *e, size_t pos)
 {
     assert(e->lines.count > 0);
@@ -577,12 +575,27 @@ static size_t editor_apply_deltas(Editor *e, size_t pos, size_t row_begin, size_
     return (size_t) ((ptrdiff_t) pos + shift);
 }
 
+// Clamped, non-zero indent width for this call - editor_indent's own
+// stack buffer is sized to EDITOR_MAX_INDENT_WIDTH, and a width of 0
+// would make Tab a silent no-op (see Editor::indent_width's comment).
+static size_t editor_clamped_indent_width(const Editor *e)
+{
+    size_t width = e->indent_width;
+    if (width == 0) width = 1;
+    if (width > EDITOR_MAX_INDENT_WIDTH) width = EDITOR_MAX_INDENT_WIDTH;
+    return width;
+}
+
 void editor_indent(Editor *e)
 {
     if (e->searching) return;
 
+    char indent[EDITOR_MAX_INDENT_WIDTH];
+    size_t width = editor_clamped_indent_width(e);
+    memset(indent, ' ', width);
+
     if (!e->selection) {
-        editor_insert_buf(e, "    ", INDENT_WIDTH);
+        editor_insert_buf(e, indent, width);
         return;
     }
 
@@ -592,7 +605,7 @@ void editor_indent(Editor *e)
 
     if (begin == end) {
         e->selection = false;
-        editor_insert_buf(e, "    ", INDENT_WIDTH);
+        editor_insert_buf(e, indent, width);
         return;
     }
 
@@ -608,9 +621,9 @@ void editor_indent(Editor *e)
     for (size_t r = row_end + 1; r > row_begin; --r) {
         size_t rr = r - 1;
         size_t at = e->lines.items[rr].begin;
-        editor_data_insert_at(e, at, "    ", INDENT_WIDTH);
-        editor_add_op(e, EDIT_INSERT, at, "    ", INDENT_WIDTH);
-        deltas[rr] = INDENT_WIDTH;
+        editor_data_insert_at(e, at, indent, width);
+        editor_add_op(e, EDIT_INSERT, at, indent, width);
+        deltas[rr] = (ptrdiff_t) width;
     }
 
     e->select_begin = editor_apply_deltas(e, begin, row_begin, row_end, deltas);
@@ -625,18 +638,20 @@ void editor_unindent(Editor *e)
 {
     if (e->searching) return;
 
+    size_t width = editor_clamped_indent_width(e);
+
     if (!e->selection) {
         size_t row = editor_row_of(e, e->cursor);
         size_t at = e->lines.items[row].begin;
         size_t end = e->lines.items[row].end;
 
         size_t remove = 0;
-        while (remove < INDENT_WIDTH && at + remove < end && e->data.items[at + remove] == ' ') {
+        while (remove < width && at + remove < end && e->data.items[at + remove] == ' ') {
             remove += 1;
         }
         if (remove == 0) return;
 
-        char spaces[INDENT_WIDTH] = {0};
+        char spaces[EDITOR_MAX_INDENT_WIDTH] = {0};
         memcpy(spaces, e->data.items + at, remove);
         editor_data_remove(e, at, remove);
         editor_add_op(e, EDIT_DELETE, at, spaces, remove);
@@ -669,14 +684,14 @@ void editor_unindent(Editor *e)
     ptrdiff_t *deltas = calloc(e->lines.count, sizeof(*deltas));
 
     // Remove bottom-up so the shorter (upper) lines keep valid positions.
-    char spaces[INDENT_WIDTH] = {0};
+    char spaces[EDITOR_MAX_INDENT_WIDTH] = {0};
     for (size_t r = row_end + 1; r > row_begin; --r) {
         size_t rr = r - 1;
         size_t at = e->lines.items[rr].begin;
         size_t line_end = e->lines.items[rr].end;
 
         size_t remove = 0;
-        while (remove < INDENT_WIDTH && at + remove < line_end && e->data.items[at + remove] == ' ') {
+        while (remove < width && at + remove < line_end && e->data.items[at + remove] == ' ') {
             remove += 1;
         }
         if (remove == 0) continue;
