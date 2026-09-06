@@ -230,12 +230,13 @@ void editor_backspace(Editor *e)
         if (e->cursor > e->data.count) {
             e->cursor = e->data.count;
         }
-        if (e->cursor == 0) return;
 
         if (e->selection) {
             editor_delete_selection(e);
             return;
         }
+
+        if (e->cursor == 0) return;
 
         size_t pos = e->cursor - 1;
         char c = e->data.items[pos];
@@ -549,18 +550,6 @@ void editor_insert_buf(Editor *e, char *buf, size_t buf_len)
     }
 }
 
-static size_t editor_row_of(const Editor *e, size_t pos)
-{
-    assert(e->lines.count > 0);
-    for (size_t row = 0; row < e->lines.count; ++row) {
-        Line line = e->lines.items[row];
-        if (line.begin <= pos && pos <= line.end) {
-            return row;
-        }
-    }
-    return e->lines.count - 1;
-}
-
 // Maps a pre-edit position to its position after every selected row `row_begin..row_end`
 // gained `deltas[r]` bytes (negative when bytes were removed). Works only while
 // `e->lines` still reflects the pre-edit layout.
@@ -609,13 +598,14 @@ void editor_indent(Editor *e)
         return;
     }
 
-    size_t row_begin = editor_row_of(e, begin);
-    size_t row_end = editor_row_of(e, end);
+    size_t row_begin = editor_row_at(e, begin);
+    size_t row_end = editor_row_at(e, end);
     if (row_end > row_begin && e->lines.items[row_end].begin == end) {
         row_end -= 1; // the selection ends exactly where a line starts
     }
 
     ptrdiff_t *deltas = calloc(e->lines.count, sizeof(*deltas));
+    if (deltas == NULL) return; // out of memory: leave the selection untouched rather than crash
 
     // Insert bottom-up so the shorter (upper) lines keep valid positions.
     for (size_t r = row_end + 1; r > row_begin; --r) {
@@ -641,7 +631,7 @@ void editor_unindent(Editor *e)
     size_t width = editor_clamped_indent_width(e);
 
     if (!e->selection) {
-        size_t row = editor_row_of(e, e->cursor);
+        size_t row = editor_row_at(e, e->cursor);
         size_t at = e->lines.items[row].begin;
         size_t end = e->lines.items[row].end;
 
@@ -675,13 +665,14 @@ void editor_unindent(Editor *e)
         return;
     }
 
-    size_t row_begin = editor_row_of(e, begin);
-    size_t row_end = editor_row_of(e, end);
+    size_t row_begin = editor_row_at(e, begin);
+    size_t row_end = editor_row_at(e, end);
     if (row_end > row_begin && e->lines.items[row_end].begin == end) {
         row_end -= 1;
     }
 
     ptrdiff_t *deltas = calloc(e->lines.count, sizeof(*deltas));
+    if (deltas == NULL) return; // out of memory: leave the selection untouched rather than crash
 
     // Remove bottom-up so the shorter (upper) lines keep valid positions.
     char spaces[EDITOR_MAX_INDENT_WIDTH] = {0};

@@ -32,11 +32,8 @@ static Editor editor = {0};
 static File_Browser fb = {0};
 static Vim_State vim = {0};
 
-// Whether Vim keybindings are active right now, everywhere input
-// happens (editor and file browser both check this). When false,
-// vim_handle_key/vim_handle_browser_key are never called at all - Vim
-// is fully inert, not just "returning false a lot" - so a bug in vim.c
-// cannot affect classic editing or browsing while it's toggled off.
+// When false, vim_handle_key/vim_handle_browser_key are never called -
+// Vim is fully inert, not just "returning false a lot".
 static bool vim_enabled = true;
 
 // Which full-screen view is active. Mutually exclusive by construction
@@ -48,9 +45,8 @@ typedef enum {
     APP_MODE_CONFIRM, // "you have unsaved changes, proceed anyway? (y/n)"
 } App_Mode;
 
-// What to do once APP_MODE_CONFIRM's y/n is answered. Set by
-// request_action() alongside the mode switch, read back by
-// perform_action() when the user confirms.
+// What to do once APP_MODE_CONFIRM's y/n is answered - set by
+// request_action(), read back by perform_action().
 typedef enum {
     CONFIRM_ACTION_OPEN_BROWSER, // F3
     CONFIRM_ACTION_NEW_FILE,     // Ctrl+N
@@ -61,11 +57,8 @@ static App_Mode mode = APP_MODE_EDITOR;
 static Confirm_Action pending_action = CONFIRM_ACTION_QUIT;
 static bool quit = false;
 
-// True for exactly one SDL_TEXTINPUT: the one immediately following a
-// SDL_KEYDOWN that changed `mode` (e.g. 'y' confirming a prompt, which
-// jumps straight back to APP_MODE_EDITOR). That trailing SDL_TEXTINPUT
-// belongs to the mode we left, not the one we switched into, so it must
-// never be typed as text regardless of the new mode's own rules.
+// True for one SDL_TEXTINPUT following a SDL_KEYDOWN that changed `mode` -
+// that trailing text belongs to the mode we left and must never be typed.
 static bool app_mode_changed_this_key = false;
 
 #define SAVE_AS_PATH_CAP 1024
@@ -76,8 +69,7 @@ static size_t save_as_path_len = 0;
 static char error_message[256] = {0};
 static Uint32 error_message_time = 0;
 
-// Errors used to go to stderr only, invisible once the app has its own
-// window - now they're also kept around to flash in a bottom bar for a
+// Also kept around (not just stderr) to flash in a bottom bar for a
 // few seconds the next time the editor view renders.
 static void flash_error(const char *fmt, ...)
 {
@@ -94,9 +86,8 @@ static void flash_error(const char *fmt, ...)
     error_message_time = SDL_GetTicks();
 }
 
-// Actually carries out a Confirm_Action, either because there was
-// nothing to lose (request_action skipped the prompt) or because the
-// user just answered 'y' to it.
+// Carries out a Confirm_Action - either request_action skipped the
+// prompt (nothing to lose), or the user just answered 'y' to it.
 static void perform_action(Confirm_Action action)
 {
     editor_flush_group(&editor);
@@ -116,10 +107,8 @@ static void perform_action(Confirm_Action action)
     }
 }
 
-// Entry point for anything that would discard unsaved work (opening the
-// file browser, starting a new file, quitting): runs immediately if the
-// buffer isn't dirty, otherwise parks the request behind an APP_MODE_CONFIRM
-// y/n prompt instead.
+// Entry point for anything that would discard unsaved work: runs
+// immediately if the buffer isn't dirty, else parks it behind a y/n prompt.
 static void request_action(Confirm_Action action)
 {
     if (editor.dirty) {
@@ -143,19 +132,14 @@ static const char *confirm_message(Confirm_Action action)
     UNREACHABLE("confirm_message");
 }
 
-// Fixed zoom for screen-space UI overlays (the bottom bar), chosen
-// independently of the document's own camera. FREE_GLYPH_FONT_SIZE (64)
-// times this is the glyphs' actual on-screen pixel height.
+// Fixed zoom for screen-space UI overlays (the bottom bar), independent
+// of the document's own camera.
 #define UI_TEXT_SCALE 0.3125f
 #define UI_BAR_HEIGHT_PX 36.0f
 #define UI_TEXT_PADDING_PX 12.0f
 
-// Draws a single-line bar pinned to the bottom edge of the window,
-// always occupying exactly UI_BAR_HEIGHT_PX screen pixels regardless of
-// window size OR the document's own pan/zoom. Uses its own fixed camera
-// transform (saved/restored around the draw call) instead of the
-// document's live one, which would otherwise zoom the bar along with an
-// extreme document auto-zoom (e.g. a near-empty buffer).
+// Draws a single-line bar pinned to the bottom edge, always exactly
+// UI_BAR_HEIGHT_PX pixels tall regardless of the document's own pan/zoom.
 static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const char *text, Vec4f bg, Vec4f fg)
 {
     Vec2f saved_camera_pos = sr->camera_pos;
@@ -183,17 +167,8 @@ static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const 
     sr->camera_scale = saved_camera_scale;
 }
 
-// ------------------------------------------------------------------------
-// Commands - see command.h. Plain zero-argument functions reading/
-// writing this file's statics, reachable by name through
-// command_find/keymap_resolve instead of a hardcoded switch case. This
-// is the seam a config file's keybinding overrides attach to, and where
-// a future plugin/scripting layer would register its own commands.
-//
-// Movement commands (shift_extends_selection = true at registration)
-// don't call editor_update_selection themselves - the dispatcher does
-// that once, generically, right before calling them.
-// ------------------------------------------------------------------------
+// Commands - see command.h. Movement commands don't call
+// editor_update_selection themselves; the dispatcher does that once, generically.
 
 static void cmd_move_line_begin(void)
 {
@@ -368,14 +343,8 @@ static void cmd_start_search(void)
     editor_start_search(&editor);
 }
 
-// Registered with shift_extends_selection = true, same as the movement
-// commands - but the original code called editor_update_selection
-// AFTER editor_stop_search, and update_selection no-ops while
-// e->searching is true. The dispatcher always resolves Shift first now,
-// so Shift+Escape while both searching and holding a selection no
-// longer clears that selection. Accepted: a zero-argument command can't
-// reproduce ordering that depends on the specific event that resolved
-// to it, and this combination is obscure enough not to matter.
+// Shift+Escape while both searching and holding a selection no longer
+// clears that selection (the dispatcher now resolves Shift before this runs).
 static void cmd_escape(void)
 {
     editor_flush_group(&editor);
@@ -437,6 +406,19 @@ typedef struct {
     Command_Fn fn;
     bool shift_extends_selection;
 } Command_Def;
+
+// Commands that must not run outside Insert mode (Enter/Backspace/Delete/
+// Tab skip vim.c's own screening since they raise no SDL_TEXTINPUT).
+static bool vim_blocks_command(const char *name)
+{
+    static const char *blocked[] = {
+        "confirm-line", "backspace", "delete-forward", "indent", "unindent",
+    };
+    for (size_t i = 0; i < ARRAY_LEN(blocked); ++i) {
+        if (strcmp(name, blocked[i]) == 0) return true;
+    }
+    return false;
+}
 
 static const Command_Def default_commands[] = {
     {"move-line-begin",     cmd_move_line_begin,     true},
@@ -725,13 +707,29 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                         editor.last_stroke = SDL_GetTicks();
                     } else {
                         const Command *cmd = keymap_resolve(event.key.keysym);
-                        if (cmd != NULL) {
+                        // Exempt while searching: vim.c itself always yields then too.
+                        bool blocked = cmd != NULL && vim_enabled && !editor.searching &&
+                                       vim.mode != VIM_MODE_INSERT && vim_blocks_command(cmd->name);
+                        if (cmd != NULL && !blocked) {
                             if (cmd->shift_extends_selection) {
                                 bool extend = (event.key.keysym.mod & KMOD_SHIFT) ||
                                               (vim_enabled && vim.mode == VIM_MODE_VISUAL);
                                 editor_update_selection(&editor, extend);
                             }
                             cmd->fn();
+                        }
+                    }
+
+                    // Keep Vim's mode in sync with editor.selection in case
+                    // a non-vim.c command (undo/redo, select-all) changed it.
+                    if (vim_enabled) {
+                        if (vim.mode == VIM_MODE_VISUAL && !editor.selection) {
+                            vim.mode = VIM_MODE_NORMAL;
+                            vim.visual_linewise = false;
+                            editor.cursor_block = true;
+                        } else if (vim.mode == VIM_MODE_NORMAL && editor.selection) {
+                            vim.mode = VIM_MODE_VISUAL;
+                            vim.visual_linewise = false;
                         }
                     }
                 } break;
