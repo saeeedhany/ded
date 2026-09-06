@@ -138,20 +138,32 @@ static const char *confirm_message(Confirm_Action action)
 #define UI_BAR_HEIGHT_PX 36.0f
 #define UI_TEXT_PADDING_PX 12.0f
 
+// Points sr's camera at the fixed UI overlay space the bottom bars share:
+// (0,0) becomes the window's bottom-left corner, independent of the
+// document's own pan/zoom. Caller must restore sr->camera_pos/camera_scale
+// afterward (see draw_bottom_bar/draw_status_bar).
+static void ui_bar_camera_begin(Simple_Renderer *sr, float *out_half_w, float *out_half_h)
+{
+    sr->camera_scale = UI_TEXT_SCALE;
+    *out_half_w = sr->resolution.x / (2.0f * UI_TEXT_SCALE);
+    *out_half_h = sr->resolution.y / (2.0f * UI_TEXT_SCALE);
+    sr->camera_pos = vec2f(*out_half_w, *out_half_h);
+}
+
 // Draws a single-line bar pinned to the bottom edge, always exactly
 // UI_BAR_HEIGHT_PX pixels tall regardless of the document's own pan/zoom.
-static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const char *text, Vec4f bg, Vec4f fg)
+// `row` stacks additional bars above row 0 (used to keep the permanent
+// status bar visible under a prompt/error bar).
+static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, size_t row, const char *text, Vec4f bg, Vec4f fg)
 {
     Vec2f saved_camera_pos = sr->camera_pos;
     float saved_camera_scale = sr->camera_scale;
 
-    sr->camera_scale = UI_TEXT_SCALE;
-    float half_w = sr->resolution.x / (2.0f * UI_TEXT_SCALE);
-    float half_h = sr->resolution.y / (2.0f * UI_TEXT_SCALE);
-    sr->camera_pos = vec2f(half_w, half_h); // (0,0) now maps to the window's bottom-left corner
+    float half_w, half_h;
+    ui_bar_camera_begin(sr, &half_w, &half_h);
 
     float bar_h = UI_BAR_HEIGHT_PX / UI_TEXT_SCALE;
-    Vec2f bar_pos = vec2f(0.0f, 0.0f);
+    Vec2f bar_pos = vec2f(0.0f, (float) row * bar_h);
     Vec2f bar_size = vec2f(2.0f * half_w, bar_h);
 
     simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
@@ -159,8 +171,64 @@ static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const 
     simple_renderer_flush(sr);
 
     simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
-    Vec2f text_pos = vec2f(UI_TEXT_PADDING_PX / UI_TEXT_SCALE, bar_h * 0.28f);
+    Vec2f text_pos = vec2f(UI_TEXT_PADDING_PX / UI_TEXT_SCALE, bar_pos.y + bar_h * 0.28f);
     free_glyph_atlas_render_line_sized(atlas, sr, text, strlen(text), &text_pos, fg);
+    simple_renderer_flush(sr);
+
+    sr->camera_pos = saved_camera_pos;
+    sr->camera_scale = saved_camera_scale;
+}
+
+// Permanent status line, always row 0: filename (with a dirty marker)
+// on the left, 1-based line:col on the right. draw_bottom_bar's prompt/
+// error overlay stacks at row 1 above it when active.
+static void draw_status_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
+{
+    Vec2f saved_camera_pos = sr->camera_pos;
+    float saved_camera_scale = sr->camera_scale;
+
+    float half_w, half_h;
+    ui_bar_camera_begin(sr, &half_w, &half_h);
+
+    float bar_h = UI_BAR_HEIGHT_PX / UI_TEXT_SCALE;
+    float pad = UI_TEXT_PADDING_PX / UI_TEXT_SCALE;
+    Vec4f fg = vec4fs(1.0f);
+
+    simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
+    simple_renderer_solid_rect(sr, vec2f(0.0f, 0.0f), vec2f(2.0f * half_w, bar_h), hex_to_vec4f(0x252525FF));
+    simple_renderer_flush(sr);
+
+    simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+    float text_y = bar_h * 0.28f;
+
+    size_t row = editor_cursor_row(&editor);
+    Line line = editor.lines.items[row];
+    char right[64];
+    int right_len = snprintf(right, sizeof(right), "Ln %zu, Col %zu", row + 1, editor.cursor - line.begin + 1);
+    Vec2f right_measure = vec2fs(0.0f);
+    free_glyph_atlas_measure_line_sized(atlas, right, (size_t) right_len, &right_measure);
+
+    // Elide the path down to just its filename (with a ".../" lead-in)
+    // if the full path would otherwise run into the line:col readout.
+    const char *path = editor.file_path.count > 0 ? editor.file_path.items : "[No Name]";
+    const char *dirty_marker = editor.dirty ? " [+]" : "";
+    char left[SAVE_AS_PATH_CAP + 8];
+    snprintf(left, sizeof(left), "%s%s", path, dirty_marker);
+
+    Vec2f left_measure = vec2fs(0.0f);
+    free_glyph_atlas_measure_line_sized(atlas, left, strlen(left), &left_measure);
+    float available = 2.0f * half_w - 2.0f * pad - right_measure.x - pad;
+    if (left_measure.x > available) {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        snprintf(left, sizeof(left), ".../%s%s", base, dirty_marker);
+    }
+
+    Vec2f left_pos = vec2f(pad, text_y);
+    free_glyph_atlas_render_line_sized(atlas, sr, left, strlen(left), &left_pos, fg);
+
+    Vec2f right_pos = vec2f(2.0f * half_w - pad - right_measure.x, text_y);
+    free_glyph_atlas_render_line_sized(atlas, sr, right, (size_t) right_len, &right_pos, fg);
     simple_renderer_flush(sr);
 
     sr->camera_pos = saved_camera_pos;
@@ -801,16 +869,17 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
             fb_render(&fb, window, &atlas, &sr);
         } else {
             editor_render(window, &atlas, &sr, &editor);
+            draw_status_bar(&sr, &atlas);
 
             Vec4f bar_fg = vec4fs(1.0f);
             if (mode == APP_MODE_CONFIRM) {
-                draw_bottom_bar(&sr, &atlas, confirm_message(pending_action), hex_to_vec4f(0x4A1D1DFF), bar_fg);
+                draw_bottom_bar(&sr, &atlas, 1, confirm_message(pending_action), hex_to_vec4f(0x4A1D1DFF), bar_fg);
             } else if (mode == APP_MODE_SAVE_AS) {
                 char prompt[SAVE_AS_PATH_CAP + 32];
                 snprintf(prompt, sizeof(prompt), "Save as: %s_", save_as_path);
-                draw_bottom_bar(&sr, &atlas, prompt, hex_to_vec4f(0x1D2E4AFF), bar_fg);
+                draw_bottom_bar(&sr, &atlas, 1, prompt, hex_to_vec4f(0x1D2E4AFF), bar_fg);
             } else if (error_message[0] != '\0' && SDL_GetTicks() - error_message_time < ERROR_DISPLAY_MS) {
-                draw_bottom_bar(&sr, &atlas, error_message, hex_to_vec4f(0x4A1D1DFF), bar_fg);
+                draw_bottom_bar(&sr, &atlas, 1, error_message, hex_to_vec4f(0x4A1D1DFF), bar_fg);
             }
         }
 

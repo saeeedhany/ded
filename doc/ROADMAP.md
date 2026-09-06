@@ -6,7 +6,7 @@ What's left, in rough priority order. See [`CHANGELOG.md`](CHANGELOG.md) for wha
 
 1. ~~**Unsaved-changes prompt**~~ / ~~**Save-as / new-file dialog**~~ — done, see CHANGELOG §2.6.
 2. ~~**Config**~~ / ~~**Line-number gutter rendering**~~ — font path, tab width, keybinding overrides, Vim on/off, and the gutter all done, see CHANGELOG §2.8/§2.10. Theme/color config is the missing piece (below). The gutter is pinned to the viewport's left edge via the live camera transform (so it doesn't pan away on a horizontally-scrolled line) but shares the document's own camera_scale for row alignment; `relative_line_numbers` shows distance-from-cursor except on the cursor's own line.
-3. **Status bar** — line:col, filename, dirty indicator (a permanent one — §2.6's bottom bar only appears for prompts/errors, not standing status), adjustable horizontal scroll.
+3. ~~**Status bar**~~ — done: a permanent bar (filename with a `.../`-elided path and `[+]` dirty marker on the left, 1-based `Ln, Col` on the right) always drawn under the document, stacked below §2.6's prompt/error bar when one is active (`draw_status_bar`/`draw_bottom_bar`'s new `row` param in `app.c`). Adjustable horizontal scroll is intentionally not part of this - the editor has no manual scroll control yet, only the automatic cursor-following camera; that'd be its own feature.
 4. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
 5. **File-browser search** — type to filter the file list (TODO in `src/app.c`).
 6. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
