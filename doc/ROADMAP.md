@@ -22,8 +22,8 @@ What's left, in rough priority order. See [`CHANGELOG.md`](CHANGELOG.md) for wha
 See `src/vim.h`'s header comment for the authoritative scope notes.
 
 1. ~~**Counts**~~ / ~~**Visual mode**~~ — done, see CHANGELOG §2.9.
-2. **Text objects** — `iw`, `aw`, `ci(`, `di"`, etc. Needs a notion of "object under cursor", not just "motion from cursor".
-3. **Linewise motions composed with operators** — `dj`, `dk`, `dgg`, `dG`. Blocked on generalizing `vim_resolve_motion` (currently only single `(buffer, pos) -> pos` motions) to express linewise ranges.
+2. ~~**Linewise motions composed with operators**~~ — `dj`, `dk`, `dgg`, `dG` done: `vim_dispatch_pending_op` resolves them directly to a row range (`vim_apply_pending_linewise_op`) instead of going through `vim_resolve_motion`, which stays charwise-only.
+3. **Text objects** — `iw`, `aw`, `ci(`, `di"`, etc. Needs a notion of "object under cursor", not just "motion from cursor".
 4. **Registers** — named (`"ay`) and numbered, instead of always going through the one system clipboard.
 5. **Authentic linewise put** — `p`/`P` after a linewise yank should insert a new line below/above, not paste charwise at the cursor.
 6. **Command-line mode** — `:w`, `:q`, `:%s/.../.../`.

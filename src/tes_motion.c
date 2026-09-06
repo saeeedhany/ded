@@ -426,6 +426,71 @@ int main(void)
     vim_handle_key(&ov, &o, KEY(SDLK_g));
     CHECK_EQ("'3gg' jumps to line 3", o.cursor, 8);
 
+    // dj/dk/dgg/dG: linewise motions composed with an operator
+    RESET_OP_TEST("one\ntwo\nthree\nfour");
+    o.cursor = 4; // inside "two"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_STR("'dj' deletes the current and next line", o.data.items, o.data.count, "one\nfour");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour");
+    o.cursor = 9; // inside "three"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_k));
+    CHECK_STR("'dk' deletes the previous and current line", o.data.items, o.data.count, "one\nfour");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 0;
+    vim_handle_key(&ov, &o, KEY(SDLK_2));
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_STR("'2dj' deletes 3 lines (current + 2 down)", o.data.items, o.data.count, "four\nfive");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 9; // inside "three"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    CHECK_STR("'dgg' deletes from the current line to the buffer's start", o.data.items, o.data.count, "four\nfive");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 4; // inside "two"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY_SHIFT(SDLK_g));
+    CHECK_STR("'dG' deletes from the current line to the buffer's end", o.data.items, o.data.count, "one");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 0; // "one"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    CHECK_STR("'d3gg' deletes lines 1 through 3", o.data.items, o.data.count, "four\nfive");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 4; // inside "two"
+    vim_handle_key(&ov, &o, KEY(SDLK_c));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_STR("'cj' merges the current and next line's content into one empty line", o.data.items, o.data.count, "one\n\nfour\nfive");
+    if (ov.mode != VIM_MODE_INSERT) { printf("FAIL: 'cj' should enter Insert mode\n"); failures++; }
+    else printf("ok:   'cj' enters Insert mode\n");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour");
+    o.cursor = 4; // inside "two"
+    vim_handle_key(&ov, &o, KEY(SDLK_y));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_STR("'yj' does not modify the buffer", o.data.items, o.data.count, "one\ntwo\nthree\nfour");
+    CHECK_EQ("'yj' moves cursor to the start of the yanked range", o.cursor, 4);
+
+    // an unrecognized key after "d g" cancels the pending delete, same as any other operator+garbage
+    RESET_OP_TEST("one\ntwo");
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    vim_handle_key(&ov, &o, KEY(SDLK_x));
+    CHECK_STR("'d' then 'g' then 'x' (not 'gg') cancels the pending delete", o.data.items, o.data.count, "one\ntwo");
+    if (ov.pending_op != VIM_OP_NONE) { printf("FAIL: pending_op should be cleared after cancelling a broken 'gg'\n"); failures++; }
+    else printf("ok:   pending_op cleared after cancelling a broken 'gg'\n");
+
     printf("\n--- vim visual mode ---\n");
 
     RESET_OP_TEST("hello world");
