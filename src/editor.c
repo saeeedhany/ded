@@ -768,6 +768,7 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
     SDL_GetWindowSize(window, &w, &h);
 
     float max_line_len = 0.0f;
+    float gutter_reserved_px = 0.0f; // set below if editor->line_numbers; narrows the cursor-follow viewport so the gutter never covers the cursor
 
     sr->resolution = vec2f(w, h);
     sr->time = (float) SDL_GetTicks() / 1000.0f;
@@ -902,13 +903,68 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
         simple_renderer_flush(sr);
     }
 
+    // Render line-number gutter. Pinned to the viewport's left edge in
+    // screen space (recomputed from the live camera each frame, per the
+    // camera_project formula in simple.vert: screen = 2*(world -
+    // camera_pos)*scale/resolution) rather than a fixed world X, so it
+    // doesn't pan away with the document on a long, horizontally-
+    // scrolled line - but it shares the document's own camera_scale, so
+    // row spacing stays aligned with the text at any zoom level. Drawn
+    // last so its background occludes whatever text has scrolled
+    // beneath it.
+    if (editor->line_numbers) {
+        size_t last_line = editor->lines.count;
+        int digits = 1;
+        for (size_t n = last_line; n >= 10; n /= 10) digits += 1;
+
+        float digit_w = atlas->metrics[(unsigned char) '0'].ax;
+        float pad = digit_w;
+        float gutter_w = digit_w * (float) digits + pad * 2.0f;
+
+        float MARGIN_PX = 4.0f;
+        float screen_left_x = sr->camera_pos.x - sr->resolution.x / (2.0f * sr->camera_scale);
+        float gutter_x = screen_left_x + MARGIN_PX / sr->camera_scale;
+        size_t cursor_row = editor_cursor_row(editor);
+
+        simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
+        for (size_t row = 0; row < editor->lines.count; ++row) {
+            Vec2f bg_pos = vec2f(screen_left_x, -((float) row + CURSOR_OFFSET) * FREE_GLYPH_FONT_SIZE);
+            simple_renderer_solid_rect(sr, bg_pos, vec2f(gutter_x + gutter_w - screen_left_x, FREE_GLYPH_FONT_SIZE), vec4f(.13f, .13f, .13f, 1.0f));
+        }
+        simple_renderer_flush(sr);
+
+        simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+        for (size_t row = 0; row < editor->lines.count; ++row) {
+            size_t number = (editor->relative_line_numbers && row != cursor_row)
+                ? (row > cursor_row ? row - cursor_row : cursor_row - row)
+                : row + 1;
+
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "%zu", number);
+
+            Vec2f measure = vec2fs(0.0f);
+            free_glyph_atlas_measure_line_sized(atlas, buf, (size_t) len, &measure);
+
+            Vec2f text_pos = vec2f(gutter_x + gutter_w - pad - measure.x, -(float) row * FREE_GLYPH_FONT_SIZE);
+            free_glyph_atlas_render_line_sized(atlas, sr, buf, (size_t) len, &text_pos, vec4f(.5f, .5f, .5f, 1.0f));
+        }
+        simple_renderer_flush(sr);
+
+        gutter_reserved_px = MARGIN_PX + gutter_w * sr->camera_scale;
+    }
+
     // Update camera
     {
         if (max_line_len > 1000.0f) {
             max_line_len = 1000.0f;
         }
 
-        float target_scale = w/3/(max_line_len*0.75); // TODO: division by 0
+        // Usable width excludes the gutter's reserved strip, so the
+        // cursor-follow math below never settles the cursor underneath it.
+        float usable_w = (float) w - gutter_reserved_px;
+        if (usable_w < 1.0f) usable_w = 1.0f;
+
+        float target_scale = usable_w/3/(max_line_len*0.75); // TODO: division by 0
 
         Vec2f target = cursor_pos;
         float offset = 0.0f;
@@ -916,9 +972,9 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
         if (target_scale > 3.0f) {
             target_scale = 3.0f;
         } else {
-            offset = cursor_pos.x - w/3/sr->camera_scale;
+            offset = cursor_pos.x - usable_w/3/sr->camera_scale;
             if (offset < 0.0f) offset = 0.0f;
-            target = vec2f(w/3/sr->camera_scale + offset, cursor_pos.y);
+            target = vec2f(usable_w/3/sr->camera_scale + offset, cursor_pos.y);
         }
 
         sr->camera_vel = vec2f_mul(
