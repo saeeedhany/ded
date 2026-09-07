@@ -70,6 +70,20 @@ static size_t save_as_path_len = 0;
 static char command_line[COMMAND_LINE_CAP] = {0};
 static size_t command_line_len = 0;
 
+// Removes the last full UTF-8 character from a NUL-terminated buffer
+// (steps back over trailing continuation bytes first) - shared by the
+// Save-As and :-command prompts' own Backspace handling below.
+static void backspace_utf8(char *buf, size_t *len)
+{
+    if (*len == 0) return;
+    size_t new_len = *len - 1;
+    while (new_len > 0 && utf8_is_continuation((unsigned char) buf[new_len])) {
+        new_len -= 1;
+    }
+    *len = new_len;
+    buf[*len] = '\0';
+}
+
 #define ERROR_DISPLAY_MS 4000
 static char error_message[256] = {0};
 static Uint32 error_message_time = 0;
@@ -792,10 +806,7 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                     break;
 
                     case SDLK_BACKSPACE: {
-                        if (save_as_path_len > 0) {
-                            save_as_path_len -= 1;
-                            save_as_path[save_as_path_len] = '\0';
-                        }
+                        backspace_utf8(save_as_path, &save_as_path_len);
                     }
                     break;
 
@@ -821,10 +832,7 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                     break;
 
                     case SDLK_BACKSPACE: {
-                        if (command_line_len > 0) {
-                            command_line_len -= 1;
-                            command_line[command_line_len] = '\0';
-                        }
+                        backspace_utf8(command_line, &command_line_len);
                     }
                     break;
 
