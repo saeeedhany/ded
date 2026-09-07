@@ -43,6 +43,7 @@ typedef enum {
     APP_MODE_FILE_BROWSER,
     APP_MODE_SAVE_AS, // typing a destination path for F2/Ctrl+Shift+S
     APP_MODE_CONFIRM, // "you have unsaved changes, proceed anyway? (y/n)"
+    APP_MODE_COMMAND, // typing an Ex-style :command (Vim Normal mode only)
 } App_Mode;
 
 // What to do once APP_MODE_CONFIRM's y/n is answered - set by
@@ -64,6 +65,10 @@ static bool app_mode_changed_this_key = false;
 #define SAVE_AS_PATH_CAP 1024
 static char save_as_path[SAVE_AS_PATH_CAP] = {0};
 static size_t save_as_path_len = 0;
+
+#define COMMAND_LINE_CAP 128
+static char command_line[COMMAND_LINE_CAP] = {0};
+static size_t command_line_len = 0;
 
 #define ERROR_DISPLAY_MS 4000
 static char error_message[256] = {0};
@@ -138,10 +143,10 @@ static const char *confirm_message(Confirm_Action action)
 #define UI_BAR_HEIGHT_PX 36.0f
 #define UI_TEXT_PADDING_PX 12.0f
 
-// Points sr's camera at the fixed UI overlay space the bottom bars share:
+// Points sr's camera at the fixed UI overlay space the status bar uses:
 // (0,0) becomes the window's bottom-left corner, independent of the
 // document's own pan/zoom. Caller must restore sr->camera_pos/camera_scale
-// afterward (see draw_bottom_bar/draw_status_bar).
+// afterward (see draw_status_bar).
 static void ui_bar_camera_begin(Simple_Renderer *sr, float *out_half_w, float *out_half_h)
 {
     sr->camera_scale = UI_TEXT_SCALE;
@@ -150,38 +155,12 @@ static void ui_bar_camera_begin(Simple_Renderer *sr, float *out_half_w, float *o
     sr->camera_pos = vec2f(*out_half_w, *out_half_h);
 }
 
-// Draws a single-line bar pinned to the bottom edge, always exactly
-// UI_BAR_HEIGHT_PX pixels tall regardless of the document's own pan/zoom.
-// `row` stacks additional bars above row 0 (used to keep the permanent
-// status bar visible under a prompt/error bar).
-static void draw_bottom_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, size_t row, const char *text, Vec4f bg, Vec4f fg)
-{
-    Vec2f saved_camera_pos = sr->camera_pos;
-    float saved_camera_scale = sr->camera_scale;
-
-    float half_w, half_h;
-    ui_bar_camera_begin(sr, &half_w, &half_h);
-
-    float bar_h = UI_BAR_HEIGHT_PX / UI_TEXT_SCALE;
-    Vec2f bar_pos = vec2f(0.0f, (float) row * bar_h);
-    Vec2f bar_size = vec2f(2.0f * half_w, bar_h);
-
-    simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
-    simple_renderer_solid_rect(sr, bar_pos, bar_size, bg);
-    simple_renderer_flush(sr);
-
-    simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
-    Vec2f text_pos = vec2f(UI_TEXT_PADDING_PX / UI_TEXT_SCALE, bar_pos.y + bar_h * 0.28f);
-    free_glyph_atlas_render_line_sized(atlas, sr, text, strlen(text), &text_pos, fg);
-    simple_renderer_flush(sr);
-
-    sr->camera_pos = saved_camera_pos;
-    sr->camera_scale = saved_camera_scale;
-}
-
-// Permanent status line, always row 0: filename (with a dirty marker)
-// on the left, 1-based line:col on the right. draw_bottom_bar's prompt/
-// error overlay stacks at row 1 above it when active.
+// Single bar pinned to the bottom edge, always exactly UI_BAR_HEIGHT_PX
+// pixels tall regardless of the document's own pan/zoom. Normally shows
+// the permanent status (filename + dirty marker on the left, 1-based
+// line:col on the right); a confirm/save-as/command-line prompt or a
+// flashed error takes it over entirely instead of stacking a second bar,
+// since only one of those is ever relevant at a time.
 static void draw_status_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
 {
     Vec2f saved_camera_pos = sr->camera_pos;
@@ -193,42 +172,63 @@ static void draw_status_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
     float bar_h = UI_BAR_HEIGHT_PX / UI_TEXT_SCALE;
     float pad = UI_TEXT_PADDING_PX / UI_TEXT_SCALE;
     Vec4f fg = vec4fs(1.0f);
+    Vec4f bg = hex_to_vec4f(0x252525FF);
+
+    char left[SAVE_AS_PATH_CAP + 32];
+    const char *right = NULL;
+    char right_buf[64];
+    int right_len = 0;
+    Vec2f right_measure = vec2fs(0.0f);
+
+    if (mode == APP_MODE_CONFIRM) {
+        bg = hex_to_vec4f(0x4A1D1DFF);
+        snprintf(left, sizeof(left), "%s", confirm_message(pending_action));
+    } else if (mode == APP_MODE_SAVE_AS) {
+        bg = hex_to_vec4f(0x1D2E4AFF);
+        snprintf(left, sizeof(left), "Save as: %s_", save_as_path);
+    } else if (mode == APP_MODE_COMMAND) {
+        bg = hex_to_vec4f(0x1D2E4AFF);
+        snprintf(left, sizeof(left), ":%s_", command_line);
+    } else if (error_message[0] != '\0' && SDL_GetTicks() - error_message_time < ERROR_DISPLAY_MS) {
+        bg = hex_to_vec4f(0x4A1D1DFF);
+        snprintf(left, sizeof(left), "%s", error_message);
+    } else {
+        size_t row = editor_cursor_row(&editor);
+        Line line = editor.lines.items[row];
+        right_len = snprintf(right_buf, sizeof(right_buf), "Ln %zu, Col %zu", row + 1, editor.cursor - line.begin + 1);
+        right = right_buf;
+        free_glyph_atlas_measure_line_sized(atlas, right, (size_t) right_len, &right_measure);
+
+        // Elide the path down to just its filename (with a ".../"
+        // lead-in) if the full path would otherwise run into line:col.
+        const char *path = editor.file_path.count > 0 ? editor.file_path.items : "[No Name]";
+        const char *dirty_marker = editor.dirty ? " [+]" : "";
+        snprintf(left, sizeof(left), "%s%s", path, dirty_marker);
+
+        Vec2f left_measure = vec2fs(0.0f);
+        free_glyph_atlas_measure_line_sized(atlas, left, strlen(left), &left_measure);
+        float available = 2.0f * half_w - 2.0f * pad - right_measure.x - pad;
+        if (left_measure.x > available) {
+            const char *base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            snprintf(left, sizeof(left), ".../%s%s", base, dirty_marker);
+        }
+    }
 
     simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
-    simple_renderer_solid_rect(sr, vec2f(0.0f, 0.0f), vec2f(2.0f * half_w, bar_h), hex_to_vec4f(0x252525FF));
+    simple_renderer_solid_rect(sr, vec2f(0.0f, 0.0f), vec2f(2.0f * half_w, bar_h), bg);
     simple_renderer_flush(sr);
 
     simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
     float text_y = bar_h * 0.28f;
 
-    size_t row = editor_cursor_row(&editor);
-    Line line = editor.lines.items[row];
-    char right[64];
-    int right_len = snprintf(right, sizeof(right), "Ln %zu, Col %zu", row + 1, editor.cursor - line.begin + 1);
-    Vec2f right_measure = vec2fs(0.0f);
-    free_glyph_atlas_measure_line_sized(atlas, right, (size_t) right_len, &right_measure);
-
-    // Elide the path down to just its filename (with a ".../" lead-in)
-    // if the full path would otherwise run into the line:col readout.
-    const char *path = editor.file_path.count > 0 ? editor.file_path.items : "[No Name]";
-    const char *dirty_marker = editor.dirty ? " [+]" : "";
-    char left[SAVE_AS_PATH_CAP + 8];
-    snprintf(left, sizeof(left), "%s%s", path, dirty_marker);
-
-    Vec2f left_measure = vec2fs(0.0f);
-    free_glyph_atlas_measure_line_sized(atlas, left, strlen(left), &left_measure);
-    float available = 2.0f * half_w - 2.0f * pad - right_measure.x - pad;
-    if (left_measure.x > available) {
-        const char *base = strrchr(path, '/');
-        base = base ? base + 1 : path;
-        snprintf(left, sizeof(left), ".../%s%s", base, dirty_marker);
-    }
-
     Vec2f left_pos = vec2f(pad, text_y);
     free_glyph_atlas_render_line_sized(atlas, sr, left, strlen(left), &left_pos, fg);
 
-    Vec2f right_pos = vec2f(2.0f * half_w - pad - right_measure.x, text_y);
-    free_glyph_atlas_render_line_sized(atlas, sr, right, (size_t) right_len, &right_pos, fg);
+    if (right != NULL) {
+        Vec2f right_pos = vec2f(2.0f * half_w - pad - right_measure.x, text_y);
+        free_glyph_atlas_render_line_sized(atlas, sr, right, (size_t) right_len, &right_pos, fg);
+    }
     simple_renderer_flush(sr);
 
     sr->camera_pos = saved_camera_pos;
@@ -411,6 +411,38 @@ static void cmd_start_search(void)
     editor_start_search(&editor);
 }
 
+// ':' from Vim's Normal mode only - Insert/Visual just type the literal
+// character, and incremental search (started independently of Vim's
+// mode, via Ctrl+F) gets first refusal on all keys of its own.
+static void cmd_start_command_line(void)
+{
+    if (!vim_enabled || editor.searching || vim.mode != VIM_MODE_NORMAL) return;
+    editor_flush_group(&editor);
+    command_line[0] = '\0';
+    command_line_len = 0;
+    mode = APP_MODE_COMMAND;
+}
+
+// The handful of Ex commands this editor understands - :w/:q/:wq/:q!,
+// all reusing the same save/quit paths as their keybindings (F2, Ctrl+Q).
+// :%s substitution is deliberately not here yet; it needs a find/replace
+// engine this codebase doesn't have (see doc/ROADMAP.md).
+static void execute_command_line(const char *cmd)
+{
+    if (strcmp(cmd, "w") == 0) {
+        cmd_save();
+    } else if (strcmp(cmd, "wq") == 0) {
+        cmd_save();
+        if (!editor.dirty) request_action(CONFIRM_ACTION_QUIT);
+    } else if (strcmp(cmd, "q") == 0) {
+        request_action(CONFIRM_ACTION_QUIT);
+    } else if (strcmp(cmd, "q!") == 0) {
+        quit = true;
+    } else if (cmd[0] != '\0') {
+        flash_error("Not an editor command: :%s", cmd);
+    }
+}
+
 // Shift+Escape while both searching and holding a selection no longer
 // clears that selection (the dispatcher now resolves Shift before this runs).
 static void cmd_escape(void)
@@ -515,6 +547,7 @@ static const Command_Def default_commands[] = {
     {"redo",                cmd_redo,                false},
     {"confirm-line",        cmd_confirm_line,        false},
     {"start-search",        cmd_start_search,        false},
+    {"start-command-line",  cmd_start_command_line,  false},
     {"select-all",          cmd_select_all,          false},
     {"indent",              cmd_indent,              false},
     {"unindent",            cmd_unindent,            false},
@@ -582,6 +615,7 @@ static const Keybind_Def default_keybindings[] = {
     {"ctrl+y",           "redo"},
     {"return",           "confirm-line"},
     {"ctrl+f",           "start-search"},
+    {"shift+;",          "start-command-line"},
     {"ctrl+a",           "select-all"},
     {"tab",              "indent"},
     {"shift+tab",        "unindent"},
@@ -770,6 +804,35 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                     }
                 } break;
 
+                case APP_MODE_COMMAND: {
+                    switch (event.key.keysym.sym) {
+                    case SDLK_RETURN: {
+                        execute_command_line(command_line);
+                        // Only close the prompt if execute_command_line
+                        // didn't already switch to something else itself
+                        // (e.g. :q on a dirty buffer parks in APP_MODE_CONFIRM).
+                        if (mode == APP_MODE_COMMAND) mode = APP_MODE_EDITOR;
+                    }
+                    break;
+
+                    case SDLK_ESCAPE: {
+                        mode = APP_MODE_EDITOR;
+                    }
+                    break;
+
+                    case SDLK_BACKSPACE: {
+                        if (command_line_len > 0) {
+                            command_line_len -= 1;
+                            command_line[command_line_len] = '\0';
+                        }
+                    }
+                    break;
+
+                    default:
+                        break;
+                    }
+                } break;
+
                 case APP_MODE_EDITOR: {
                     if (vim_enabled && vim_handle_key(&vim, &editor, event.key.keysym)) {
                         editor.last_stroke = SDL_GetTicks();
@@ -834,6 +897,16 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                 }
                 break;
 
+                case APP_MODE_COMMAND: {
+                    const char *text = event.text.text;
+                    size_t text_len = strlen(text);
+                    for (size_t i = 0; i < text_len && command_line_len + 1 < COMMAND_LINE_CAP; ++i) {
+                        command_line[command_line_len++] = text[i];
+                    }
+                    command_line[command_line_len] = '\0';
+                }
+                break;
+
                 case APP_MODE_EDITOR:
                     if (vim_take_consumed_textinput(&vim)) {
                         // key already claimed by vim_handle_key; don't also type it
@@ -870,17 +943,6 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
         } else {
             editor_render(window, &atlas, &sr, &editor);
             draw_status_bar(&sr, &atlas);
-
-            Vec4f bar_fg = vec4fs(1.0f);
-            if (mode == APP_MODE_CONFIRM) {
-                draw_bottom_bar(&sr, &atlas, 1, confirm_message(pending_action), hex_to_vec4f(0x4A1D1DFF), bar_fg);
-            } else if (mode == APP_MODE_SAVE_AS) {
-                char prompt[SAVE_AS_PATH_CAP + 32];
-                snprintf(prompt, sizeof(prompt), "Save as: %s_", save_as_path);
-                draw_bottom_bar(&sr, &atlas, 1, prompt, hex_to_vec4f(0x1D2E4AFF), bar_fg);
-            } else if (error_message[0] != '\0' && SDL_GetTicks() - error_message_time < ERROR_DISPLAY_MS) {
-                draw_bottom_bar(&sr, &atlas, 1, error_message, hex_to_vec4f(0x4A1D1DFF), bar_fg);
-            }
         }
 
         SDL_GL_SwapWindow(window);

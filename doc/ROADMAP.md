@@ -6,7 +6,7 @@ What's left, in rough priority order. See [`CHANGELOG.md`](CHANGELOG.md) for wha
 
 1. ~~**Unsaved-changes prompt**~~ / ~~**Save-as / new-file dialog**~~ — done, see CHANGELOG §2.6.
 2. ~~**Config**~~ / ~~**Line-number gutter rendering**~~ — font path, tab width, keybinding overrides, Vim on/off, and the gutter all done, see CHANGELOG §2.8/§2.10. Theme/color config is the missing piece (below). The gutter is pinned to the viewport's left edge via the live camera transform (so it doesn't pan away on a horizontally-scrolled line) but shares the document's own camera_scale for row alignment; `relative_line_numbers` shows distance-from-cursor except on the cursor's own line.
-3. ~~**Status bar**~~ — done: a permanent bar (filename with a `.../`-elided path and `[+]` dirty marker on the left, 1-based `Ln, Col` on the right) always drawn under the document, stacked below §2.6's prompt/error bar when one is active (`draw_status_bar`/`draw_bottom_bar`'s new `row` param in `app.c`). Adjustable horizontal scroll is intentionally not part of this - the editor has no manual scroll control yet, only the automatic cursor-following camera; that'd be its own feature.
+3. ~~**Status bar**~~ — done: a single permanent bar (`draw_status_bar` in `app.c`), normally showing filename (`.../`-elided path plus a `[+]` dirty marker) on the left and 1-based `Ln, Col` on the right - a confirm/save-as/`:`-command prompt or a flashed error takes the same bar over entirely instead of stacking a second one, since only one is ever relevant at a time. Adjustable horizontal scroll is intentionally not part of this - the editor has no manual scroll control yet, only the automatic cursor-following camera; that'd be its own feature.
 4. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
 5. **File-browser search** — type to filter the file list (TODO in `src/app.c`).
 6. **UTF-8 support** — the big correctness gap: the glyph atlas is ASCII-only (128 glyphs), and editing is byte-wise, so word jumps, Backspace, and highlighting all break on non-ASCII text.
@@ -25,7 +25,7 @@ See `src/vim.h`'s header comment for the authoritative scope notes.
 3. **Text objects** — `iw`, `aw`, `ci(`, `di"`, etc. Needs a notion of "object under cursor", not just "motion from cursor".
 4. **Registers** — named (`"ay`) and numbered, instead of always going through the one system clipboard.
 5. **Authentic linewise put** — `p`/`P` after a linewise yank should insert a new line below/above, not paste charwise at the cursor.
-6. **Command-line mode** — `:w`, `:q`, `:%s/.../.../`.
+6. ~~**Command-line mode**~~ — `:w`/`:q`/`:wq`/`:q!` done: `:` (Normal mode only) enters `app.c`'s `APP_MODE_COMMAND`, bound via the keymap like Ctrl+F search rather than wired into `vim.c` at all. The command-line prompt shares the status bar's single row rather than stacking a separate bar. `:%s/.../.../ ` is deliberately still not here - it needs a find/replace engine this codebase doesn't have yet (Main track #4, "Search improvements"); building it now would mean redoing it once that lands.
 7. **Macros and marks** — `qa...q`, `@a`, `` ` ``/`'`.
 8. **A real Vim word model** — `w`/`b`/`e` currently use this codebase's existing alnum-vs-everything-else split; real Vim distinguishes punctuation runs from word runs too.
 9. **Sticky column for `j`/`k`** — see NOTES.md; matters more once Vim's vertical motions are counted/composed.
